@@ -1,4 +1,10 @@
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys'
+import {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+} from '@whiskeysockets/baileys'
 import pino from 'pino'
 import qrcode from 'qrcode-terminal'
 import dotenv from 'dotenv'
@@ -7,9 +13,16 @@ import {
   getActiveReservations,
   createOrder,
   generateQr,
+  updateOrderStatus,
 } from './api.service.js'
 
 dotenv.config()
+
+const firstNotificationMs = Number(process.env.FIRST_NOTIFICATION_MS) || 120000
+const secondNotificationMs =
+  Number(process.env.SECOND_NOTIFICATION_MS) || 240000
+const reservationLostMs = Number(process.env.RESERVATION_LOST_MS) || 300000
+const orderCancelMs = Number(process.env.ORDER_CANCEL_MS) || 360000
 
 function parseReservationMessage(
   text: string,
@@ -35,13 +48,20 @@ function parseReservationMessage(
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
   const { version } = await fetchLatestBaileysVersion()
+  const logger = pino({ level: 'silent' })
 
   const sock = makeWASocket({
     version,
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
     printQRInTerminal: false,
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
     browser: ['LiveSales', 'Chrome', '10.0.0'],
-    logger: pino({ level: 'silent' })
+    logger,
+    getMessage: async () => undefined,
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -55,7 +75,9 @@ async function connectToWhatsApp() {
     }
 
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut
+      const shouldReconnect =
+        (lastDisconnect?.error as Boom)?.output?.statusCode !==
+        DisconnectReason.loggedOut
       console.log('Conexion cerrada, reconectando:', shouldReconnect)
       if (shouldReconnect) {
         connectToWhatsApp()
@@ -73,20 +95,22 @@ async function connectToWhatsApp() {
     if (!msg.key.remoteJid || msg.key.fromMe) return
     if (msg.key.remoteJid.endsWith('@g.us')) return
 
-    const incomingText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
-    
+    const userJid = msg.key.remoteJid
+    const incomingText =
+      msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
+
     if (!incomingText) return
 
     console.log('--- MENSAJE DE CHAT RECIBIDO ---')
-    console.log('De:', msg.key.remoteJid)
+    console.log('De:', userJid)
     console.log('Texto:', incomingText)
 
     const parsedData = parseReservationMessage(incomingText)
 
     if (!parsedData) {
       console.log('Mensaje no coincide con el formato. Enviando instrucciones.')
-      await sock.sendMessage(msg.key.remoteJid, { 
-        text: 'Gracias por comunicarte con Tienda LiveSales, Si realizaste una reserva por tiktok, por favor envianos la siguiente informacion en este formato:\n\nnombre de usuario:\ncodigo de producto:' 
+      await sock.sendMessage(userJid, {
+        text: 'Gracias por comunicarte con Tienda LiveSales, Si realizaste una reserva por tiktok, por favor envianos la siguiente informacion en este formato:\n\nnombre de usuario:\ncodigo de producto:',
       })
       return
     }
@@ -109,15 +133,15 @@ async function connectToWhatsApp() {
 
       if (!found) {
         console.log('Reserva no encontrada en la lista activa.')
-        await sock.sendMessage(msg.key.remoteJid, { 
-          text: 'Debe ir al live de @LiveSales y realizar su reserva.' 
+        await sock.sendMessage(userJid, {
+          text: 'Debe ir al live de @LiveSales y realizar su reserva.',
         })
         return
       }
 
       console.log(`Reserva verificada exitosamente: ID ${found.id}`)
 
-      const realWhatsapp = msg.key.remoteJid.split('@')[0]
+      const realWhatsapp = userJid.split('@')[0]
       const priceNumber = parseFloat(found.product.price)
 
       console.log(
@@ -137,9 +161,12 @@ async function connectToWhatsApp() {
         ],
       })
 
-      console.log(`Orden #${order.id} creada. Solicitando QR a Canela Bank y Cloudinary...`)
+      const currentOrderId = order.id
+      console.log(
+        `Orden #${currentOrderId} creada. Solicitando QR a Canela Bank y Cloudinary...`,
+      )
 
-      const qrData = await generateQr(order.id)
+      const qrData = await generateQr(currentOrderId)
 
       const paymentInstructions =
         'Por favor realice el pago de su producto con el siguiente QR o ingresando al enlace de pago directo:\n' +
@@ -147,16 +174,66 @@ async function connectToWhatsApp() {
         '*NOTA: Tiene 5 minutos desde este momento para realizar su pago, caso contrario perdera la reserva.*\n\n' +
         'Una vez realizado el pago por favor envie el comprobante de pago, en caso de no poder continuar con la compra, por favor escriba: Cancelar Reserva.'
 
-      await sock.sendMessage(msg.key.remoteJid, {
+      await sock.sendMessage(userJid, {
         image: { url: qrData.qrImageUrl },
-        caption: paymentInstructions
+        caption: paymentInstructions,
       })
 
-      console.log(`Imagen y texto enviados exitosamente a ${msg.key.remoteJid}`)
+      console.log(`Imagen y texto enviados exitosamente a ${userJid}`)
+
+      setTimeout(async () => {
+        try {
+          await sock.sendMessage(userJid, {
+            text: 'Atencion le quedan 3 minutos para realizar el pago o perdera la reserva',
+          })
+        } catch (err) {
+          console.error('Error enviando primera notificacion:', err)
+        }
+      }, firstNotificationMs)
+
+      setTimeout(async () => {
+        try {
+          await sock.sendMessage(userJid, {
+            text: 'Atencion le queda 1 minuto para realizar el pago o perdera la reserva',
+          })
+        } catch (err) {
+          console.error('Error enviando segunda notificacion:', err)
+        }
+      }, secondNotificationMs)
+
+      setTimeout(async () => {
+        try {
+          await sock.sendMessage(userJid, {
+            text: 'Perdio la reserva debido a que no realizo el pago en el tiempo establecido.',
+          })
+        } catch (err) {
+          console.error(
+            'Error enviando notificacion de perdida de reserva:',
+            err,
+          )
+        }
+      }, reservationLostMs)
+
+      setTimeout(async () => {
+        try {
+          console.log(
+            `Tiempo limite alcanzado. Cancelando orden #${currentOrderId} en la API...`,
+          )
+          await updateOrderStatus(currentOrderId, 'CANCELLED')
+          console.log(
+            `Orden #${currentOrderId} cancelada exitosamente en la API.`,
+          )
+        } catch (err) {
+          console.error(
+            `Error cancelando la orden #${currentOrderId} en la API:`,
+            err,
+          )
+        }
+      }, orderCancelMs)
     } catch (error) {
       console.error('Error procesando el flujo de reserva y orden:', error)
-      await sock.sendMessage(msg.key.remoteJid, { 
-        text: 'Ocurrio un problema al procesar su orden. Por favor intenta mas tarde.' 
+      await sock.sendMessage(userJid, {
+        text: 'Ocurrio un problema al procesar su orden. Por favor intenta mas tarde.',
       })
     }
   })

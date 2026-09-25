@@ -180,3 +180,25 @@ export async function generateQr(
   console.log('QR generado exitosamente para la orden:', orderId)
   return result.data
 }
+
+export async function updateOrderStatus(
+  orderId: number,
+  status: string,
+): Promise<any> {
+  const response = await fetchWithAuth(`/orders/${orderId}/status`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ status }),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(
+      `Error actualizando estado de la orden ${orderId}: ${response.status} - ${errorText}`,
+    )
+  }
+
+  return response.json()
+}
