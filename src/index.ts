@@ -1,7 +1,8 @@
-import pkg from 'whatsapp-web.js'
-const { Client, LocalAuth, MessageMedia } = pkg
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys'
+import pino from 'pino'
 import qrcode from 'qrcode-terminal'
 import dotenv from 'dotenv'
+import { Boom } from '@hapi/boom'
 import {
   getActiveReservations,
   createOrder,
@@ -10,187 +11,155 @@ import {
 
 dotenv.config()
 
-console.log('Iniciando configuracion del cliente de WhatsApp...')
-
-const client = new Client({
-  authStrategy: new LocalAuth({
-    dataPath: './.wwebjs_auth',
-  }),
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-gpu',
-    ],
-  },
-})
-
-client.on('qr', (qr: string) => {
-  console.log('CODIGO QR RECIBIDO:')
-  qrcode.generate(qr, { small: true })
-})
-
-client.on('authenticated', () => {
-  console.log('AUTENTICACION EXITOSA: Sesion restaurada.')
-})
-
-client.on('auth_failure', (msg: string) => {
-  console.error('FALLO DE AUTENTICACION:', msg)
-})
-
-client.on('ready', () => {
-  console.log('CLIENTE LISTO: Bot escuchando mensajes.')
-})
-
 function parseReservationMessage(
   text: string,
-): { username: string; productCode: string; phone: string } | null {
+): { username: string; productCode: string } | null {
   const clean = text.trim()
   const userRegex = /(?:nombre\s*de\s*usuario|usuario|user)\s*:\s*([^\n\r]+)/i
   const productRegex =
     /(?:codigo\s*de\s*producto|producto|codigo)\s*:\s*([^\n\r]+)/i
-  const phoneRegex =
-    /(?:numero\s*de\s*whatsapp|whatsapp|telefono|numero)\s*:\s*([^\n\r]+)/i
 
   const userMatch = clean.match(userRegex)
   const productMatch = clean.match(productRegex)
-  const phoneMatch = clean.match(phoneRegex)
 
-  if (userMatch && productMatch && phoneMatch) {
+  if (userMatch && productMatch) {
     return {
       username: userMatch[1].trim().toLowerCase().replace(/^@/, ''),
       productCode: productMatch[1].trim().toUpperCase(),
-      phone: phoneMatch[1].trim(),
     }
   }
 
   return null
 }
 
-client.on('message', async (message) => {
-  if (message.type !== 'chat') {
-    return
-  }
+async function connectToWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
+  const { version } = await fetchLatestBaileysVersion()
 
-  if (message.from.endsWith('@g.us')) {
-    return
-  }
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    browser: ['LiveSales', 'Chrome', '10.0.0'],
+    logger: pino({ level: 'silent' })
+  })
 
-  const incomingText = message.body || ''
-  console.log('--- MENSAJE DE CHAT RECIBIDO ---')
-  console.log('De:', message.from)
-  console.log('Texto:', incomingText)
+  sock.ev.on('creds.update', saveCreds)
 
-  const parsedData = parseReservationMessage(incomingText)
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update
 
-  if (!parsedData) {
-    console.log('Mensaje no coincide con el formato. Enviando instrucciones.')
-    await client.sendMessage(
-      message.from,
-      'Gracias por comunicarte con Tienda LiveSales, Si realizaste una reserva por tiktok, por favor envianos la siguiente informacion en este formato:',
-    )
-    await client.sendMessage(
-      message.from,
-      'nombre de usuario:\ncodigo de producto:\nnumero de whatsapp:',
-    )
-    return
-  }
+    if (qr) {
+      console.log('CODIGO QR RECIBIDO:')
+      qrcode.generate(qr, { small: true })
+    }
 
-  console.log('Datos extraidos con exito:')
-  console.log('Usuario:', parsedData.username)
-  console.log('Codigo de producto:', parsedData.productCode)
-  console.log('Numero ingresado:', parsedData.phone)
+    if (connection === 'close') {
+      const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut
+      console.log('Conexion cerrada, reconectando:', shouldReconnect)
+      if (shouldReconnect) {
+        connectToWhatsApp()
+      }
+    } else if (connection === 'open') {
+      console.log('AUTENTICACION EXITOSA: Sesion iniciada.')
+      console.log('CLIENTE LISTO: Bot escuchando mensajes.')
+    }
+  })
 
-  try {
-    const reservations = await getActiveReservations()
+  sock.ev.on('messages.upsert', async (m) => {
+    if (m.type !== 'notify') return
+    const msg = m.messages[0]
 
-    const found = reservations.find((r) => {
-      const matchUser =
-        r.tiktokUsername.trim().toLowerCase().replace(/^@/, '') ===
-        parsedData.username
-      const matchCode =
-        r.productCode.trim().toUpperCase() === parsedData.productCode
-      return matchUser && matchCode
-    })
+    if (!msg.key.remoteJid || msg.key.fromMe) return
+    if (msg.key.remoteJid.endsWith('@g.us')) return
 
-    if (!found) {
-      console.log('Reserva no encontrada en la lista activa.')
-      await client.sendMessage(
-        message.from,
-        'Debe ir al live de @LiveSales y realizar su reserva.',
-      )
+    const incomingText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
+    
+    if (!incomingText) return
+
+    console.log('--- MENSAJE DE CHAT RECIBIDO ---')
+    console.log('De:', msg.key.remoteJid)
+    console.log('Texto:', incomingText)
+
+    const parsedData = parseReservationMessage(incomingText)
+
+    if (!parsedData) {
+      console.log('Mensaje no coincide con el formato. Enviando instrucciones.')
+      await sock.sendMessage(msg.key.remoteJid, { 
+        text: 'Gracias por comunicarte con Tienda LiveSales, Si realizaste una reserva por tiktok, por favor envianos la siguiente informacion en este formato:\n\nnombre de usuario:\ncodigo de producto:' 
+      })
       return
     }
 
-    console.log(`Reserva verificada exitosamente: ID ${found.id}`)
+    console.log('Datos extraidos con exito:')
+    console.log('Usuario:', parsedData.username)
+    console.log('Codigo de producto:', parsedData.productCode)
 
-    let cleanPhone = parsedData.phone.replace(/\D/g, '')
+    try {
+      const reservations = await getActiveReservations()
 
-    if (cleanPhone.length <= 8) {
-      cleanPhone = `591${cleanPhone}`
-    }
+      const found = reservations.find((r) => {
+        const matchUser =
+          r.tiktokUsername.trim().toLowerCase().replace(/^@/, '') ===
+          parsedData.username
+        const matchCode =
+          r.productCode.trim().toUpperCase() === parsedData.productCode
+        return matchUser && matchCode
+      })
 
-    const sendTarget = `${cleanPhone}@c.us`
-    const priceNumber = parseFloat(found.product.price)
+      if (!found) {
+        console.log('Reserva no encontrada en la lista activa.')
+        await sock.sendMessage(msg.key.remoteJid, { 
+          text: 'Debe ir al live de @LiveSales y realizar su reserva.' 
+        })
+        return
+      }
 
-    console.log(
-      `Procediendo a crear orden para cliente: ${found.tiktokUsername}, Telefono: ${cleanPhone}`,
-    )
+      console.log(`Reserva verificada exitosamente: ID ${found.id}`)
 
-    const order = await createOrder({
-      clientName: found.tiktokUsername,
-      whatsapp: cleanPhone,
-      streamId: found.streamId,
-      items: [
-        {
-          productId: found.productId,
-          quantity: 1,
-          price: priceNumber,
-        },
-      ],
-    })
+      const realWhatsapp = msg.key.remoteJid.split('@')[0]
+      const priceNumber = parseFloat(found.product.price)
 
-    console.log(
-      `Orden #${order.id} creada. Solicitando QR a Canela Bank y Cloudinary...`,
-    )
-
-    if (message.from !== sendTarget) {
-      await client.sendMessage(
-        message.from,
-        `Orden generada. Enviaremos el QR y las instrucciones a su numero: ${cleanPhone}`,
+      console.log(
+        `Procediendo a crear orden para cliente: ${found.tiktokUsername}, Telefono: ${realWhatsapp}`,
       )
+
+      const order = await createOrder({
+        clientName: found.tiktokUsername,
+        whatsapp: realWhatsapp,
+        streamId: found.streamId,
+        items: [
+          {
+            productId: found.productId,
+            quantity: 1,
+            price: priceNumber,
+          },
+        ],
+      })
+
+      console.log(`Orden #${order.id} creada. Solicitando QR a Canela Bank y Cloudinary...`)
+
+      const qrData = await generateQr(order.id)
+
+      const paymentInstructions =
+        'Por favor realice el pago de su producto con el siguiente QR o ingresando al enlace de pago directo:\n' +
+        `${qrData.qrUrl}\n\n` +
+        '*NOTA: Tiene 5 minutos desde este momento para realizar su pago, caso contrario perdera la reserva.*\n\n' +
+        'Una vez realizado el pago por favor envie el comprobante de pago, en caso de no poder continuar con la compra, por favor escriba: Cancelar Reserva.'
+
+      await sock.sendMessage(msg.key.remoteJid, {
+        image: { url: qrData.qrImageUrl },
+        caption: paymentInstructions
+      })
+
+      console.log(`Imagen y texto enviados exitosamente a ${msg.key.remoteJid}`)
+    } catch (error) {
+      console.error('Error procesando el flujo de reserva y orden:', error)
+      await sock.sendMessage(msg.key.remoteJid, { 
+        text: 'Ocurrio un problema al procesar su orden. Por favor intenta mas tarde.' 
+      })
     }
+  })
+}
 
-    const qrData = await generateQr(order.id)
-
-    const media = await MessageMedia.fromUrl(qrData.qrImageUrl)
-
-    const paymentInstructions =
-      'Por favor realice el pago de su producto con el siguiente QR o ingresando al enlace de pago directo:\n' +
-      `${qrData.qrUrl}\n\n` +
-      '*NOTA: Tiene 5 minutos desde este momento para realizar su pago, caso contrario perdera la reserva.*\n\n' +
-      'Una vez realizado el pago por favor envie el comprobante de pago, en caso de no poder continuar con la compra, por favor escriba: Cancelar Reserva.'
-
-    await client.sendMessage(sendTarget, media, {
-      caption: paymentInstructions,
-    })
-
-    console.log(`Imagen y texto enviados exitosamente a ${sendTarget}`)
-  } catch (error) {
-    console.error('Error procesando el flujo de reserva y orden:', error)
-    await client.sendMessage(
-      message.from,
-      'Ocurrio un problema al procesar su orden. Por favor intenta mas tarde.',
-    )
-  }
-})
-
-console.log('Llamando a client.initialize()...')
-client.initialize().catch((err: unknown) => {
-  console.error('Error durante client.initialize():', err)
-})
+connectToWhatsApp()
