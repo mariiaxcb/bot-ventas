@@ -1,8 +1,12 @@
 import pkg from 'whatsapp-web.js'
-const { Client, LocalAuth } = pkg
+const { Client, LocalAuth, MessageMedia } = pkg
 import qrcode from 'qrcode-terminal'
 import dotenv from 'dotenv'
-import { getActiveReservations } from './api.service.js'
+import {
+  getActiveReservations,
+  createOrder,
+  generateQr,
+} from './api.service.js'
 
 dotenv.config()
 
@@ -45,19 +49,23 @@ client.on('ready', () => {
 
 function parseReservationMessage(
   text: string,
-): { username: string; productCode: string } | null {
+): { username: string; productCode: string; phone: string } | null {
   const clean = text.trim()
   const userRegex = /(?:nombre\s*de\s*usuario|usuario|user)\s*:\s*([^\n\r]+)/i
   const productRegex =
     /(?:codigo\s*de\s*producto|producto|codigo)\s*:\s*([^\n\r]+)/i
+  const phoneRegex =
+    /(?:numero\s*de\s*whatsapp|whatsapp|telefono|numero)\s*:\s*([^\n\r]+)/i
 
   const userMatch = clean.match(userRegex)
   const productMatch = clean.match(productRegex)
+  const phoneMatch = clean.match(phoneRegex)
 
-  if (userMatch && productMatch) {
+  if (userMatch && productMatch && phoneMatch) {
     return {
       username: userMatch[1].trim().toLowerCase().replace(/^@/, ''),
       productCode: productMatch[1].trim().toUpperCase(),
+      phone: phoneMatch[1].trim(),
     }
   }
 
@@ -88,7 +96,7 @@ client.on('message', async (message) => {
     )
     await client.sendMessage(
       message.from,
-      'nombre de usuario:\ncodigo de producto:',
+      'nombre de usuario:\ncodigo de producto:\nnumero de whatsapp:',
     )
     return
   }
@@ -96,6 +104,7 @@ client.on('message', async (message) => {
   console.log('Datos extraidos con exito:')
   console.log('Usuario:', parsedData.username)
   console.log('Codigo de producto:', parsedData.productCode)
+  console.log('Numero ingresado:', parsedData.phone)
 
   try {
     const reservations = await getActiveReservations()
@@ -109,21 +118,74 @@ client.on('message', async (message) => {
       return matchUser && matchCode
     })
 
-    if (found) {
-      console.log(`Reserva encontrada exitosamente: ID ${found.id}`)
-      await client.sendMessage(message.from, 'Reserva verificada')
-    } else {
+    if (!found) {
       console.log('Reserva no encontrada en la lista activa.')
       await client.sendMessage(
         message.from,
         'Debe ir al live de @LiveSales y realizar su reserva.',
       )
+      return
     }
+
+    console.log(`Reserva verificada exitosamente: ID ${found.id}`)
+
+    let cleanPhone = parsedData.phone.replace(/\D/g, '')
+
+    if (cleanPhone.length <= 8) {
+      cleanPhone = `591${cleanPhone}`
+    }
+
+    const sendTarget = `${cleanPhone}@c.us`
+    const priceNumber = parseFloat(found.product.price)
+
+    console.log(
+      `Procediendo a crear orden para cliente: ${found.tiktokUsername}, Telefono: ${cleanPhone}`,
+    )
+
+    const order = await createOrder({
+      clientName: found.tiktokUsername,
+      whatsapp: cleanPhone,
+      streamId: found.streamId,
+      items: [
+        {
+          productId: found.productId,
+          quantity: 1,
+          price: priceNumber,
+        },
+      ],
+    })
+
+    console.log(
+      `Orden #${order.id} creada. Solicitando QR a Canela Bank y Cloudinary...`,
+    )
+
+    if (message.from !== sendTarget) {
+      await client.sendMessage(
+        message.from,
+        `Orden generada. Enviaremos el QR y las instrucciones a su numero: ${cleanPhone}`,
+      )
+    }
+
+    const qrData = await generateQr(order.id)
+
+    const media = await MessageMedia.fromUrl(qrData.qrImageUrl)
+
+    const paymentInstructions =
+      'Por favor realice el pago de su producto con el siguiente QR o ingresando al enlace de pago directo:\n' +
+      `${qrData.qrUrl}\n\n` +
+      '*NOTA: Tiene 5 minutos desde este momento para realizar su pago, caso contrario perdera la reserva.*\n\n' +
+      'Una vez realizado el pago por favor envie el comprobante de pago, en caso de no poder continuar con la compra, por favor escriba: Cancelar Reserva.'
+
+    await client.sendMessage(sendTarget, media, {
+      caption: paymentInstructions,
+    })
+
+    console.log(`Imagen y texto enviados exitosamente a ${sendTarget}`)
   } catch (error) {
-    console.error('Error procesando la verificacion:', error)
+    console.error('Error procesando el flujo de reserva y orden:', error)
     await client.sendMessage(
       message.from,
-      'Ocurrio un problema al verificar la reserva. Por favor intenta mas tarde.',
+      'Ocurrio un problema al procesar su orden. Por favor intenta mas tarde.',
     )
   }
 })

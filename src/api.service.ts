@@ -26,6 +26,43 @@ export interface ReservationItem {
   }
 }
 
+export interface CreateOrderPayload {
+  clientName: string
+  whatsapp: string
+  streamId: number
+  items: {
+    productId: number
+    quantity: number
+    price: number
+  }[]
+}
+
+export interface OrderResponseData {
+  id: number
+  customerName: string
+  phone: string
+  total: string
+  status: string
+  streamId: number
+  createdAt: string
+  items: {
+    id: number
+    orderId: number
+    productId: number
+    quantity: number
+    price: string
+  }[]
+}
+
+export interface GenerateQrResponseData {
+  qrImageUrl: string
+  qrUrl: string
+  transactionId?: string
+  amount?: string
+  currency?: string
+  expiresAt?: string
+}
+
 async function login(): Promise<string> {
   console.log('Solicitando autenticacion a la API...')
   const response = await fetch(`${API_BASE_URL}/auth/login`, {
@@ -94,4 +131,52 @@ export async function getActiveReservations(): Promise<ReservationItem[]> {
   const result = await response.json()
   console.log(`Reservas activas obtenidas: ${result.data?.length || 0}`)
   return result.data || []
+}
+
+export async function createOrder(
+  payload: CreateOrderPayload,
+): Promise<OrderResponseData> {
+  console.log('Creando orden en la API:', JSON.stringify(payload))
+  const response = await fetchWithAuth('/orders', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  })
+
+  const result = await response.json()
+
+  if (!response.ok) {
+    console.error('Detalle error API createOrder:', JSON.stringify(result))
+    throw new Error(
+      `Error al crear orden: ${response.status} - ${result.message || response.statusText}`,
+    )
+  }
+
+  console.log('Orden creada exitosamente con ID:', result.data.id)
+  return result.data
+}
+
+export async function generateQr(
+  orderId: number,
+): Promise<GenerateQrResponseData> {
+  console.log(`Generando QR para la orden ID: ${orderId}...`)
+  const response = await fetchWithAuth(`/orders/${orderId}/generate-qr`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({}),
+  })
+
+  if (!response.ok) {
+    throw new Error(
+      `Error al generar QR: ${response.status} ${response.statusText}`,
+    )
+  }
+
+  const result = await response.json()
+  console.log('QR generado exitosamente para la orden:', orderId)
+  return result.data
 }
