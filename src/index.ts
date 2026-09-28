@@ -4,6 +4,7 @@ import {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  downloadMediaMessage,
 } from '@whiskeysockets/baileys'
 import pino from 'pino'
 import qrcode from 'qrcode-terminal'
@@ -14,6 +15,8 @@ import {
   createOrder,
   generateQr,
   updateOrderStatus,
+  getPendingOrderByWhatsapp,
+  uploadReceipt,
 } from './api.service.js'
 
 dotenv.config()
@@ -62,6 +65,8 @@ async function connectToWhatsApp() {
     browser: ['LiveSales', 'Chrome', '10.0.0'],
     logger,
     getMessage: async () => undefined,
+    shouldIgnoreJid: (jid) =>
+      jid.endsWith('@g.us') || jid.endsWith('@broadcast'),
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -96,33 +101,65 @@ async function connectToWhatsApp() {
     if (msg.key.remoteJid.endsWith('@g.us')) return
 
     const userJid = msg.key.remoteJid
+    const realWhatsapp = userJid.split('@')[0]
+
+    const imageMessage =
+      msg.message?.imageMessage ||
+      msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage
+
+    if (imageMessage) {
+      const pendingOrder = await getPendingOrderByWhatsapp(realWhatsapp)
+
+      if (!pendingOrder) {
+        await sock.sendMessage(userJid, {
+          text: 'No tienes ninguna orden pendiente de pago en este momento.',
+        })
+        return
+      }
+
+      await sock.sendMessage(userJid, {
+        text: '⏳ Procesando tu comprobante mediante Inteligencia Artificial, por favor espera unos segundos...',
+      })
+
+      try {
+        const buffer = await downloadMediaMessage(
+          msg,
+          'buffer',
+          {},
+          { logger, reuploadRequest: sock.updateMediaMessage },
+        )
+
+        await uploadReceipt(pendingOrder.id, buffer as Buffer)
+
+        await sock.sendMessage(userJid, {
+          text: '✅ ¡Pago verificado con éxito! Tu orden ha sido marcada como PAGADA y tu producto está asegurado.',
+        })
+      } catch (error: any) {
+        await sock.sendMessage(userJid, {
+          text: `❌ Hubo un problema validando tu pago:\n${error.message}\n\nPor favor verifica y envía la foto nuevamente.`,
+        })
+      }
+      return
+    }
+
     const incomingText =
       msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
 
     if (!incomingText) return
 
-    console.log('--- MENSAJE DE CHAT RECIBIDO ---')
-    console.log('De:', userJid)
-    console.log('Texto:', incomingText)
-
     const parsedData = parseReservationMessage(incomingText)
 
     if (!parsedData) {
-      console.log('Mensaje no coincide con el formato. Enviando instrucciones.')
       await sock.sendMessage(userJid, {
         text: 'Gracias por comunicarte con Tienda LiveSales, Si realizaste una reserva por tiktok, por favor envianos la siguiente informacion en este formato:\n\nnombre de usuario:\ncodigo de producto:',
       })
       return
     }
 
-    console.log('Datos extraidos con exito:')
-    console.log('Usuario:', parsedData.username)
-    console.log('Codigo de producto:', parsedData.productCode)
-
     try {
       const reservations = await getActiveReservations()
 
-      const found = reservations.find((r) => {
+      const found = reservations.find((r: any) => {
         const matchUser =
           r.tiktokUsername.trim().toLowerCase().replace(/^@/, '') ===
           parsedData.username
@@ -132,26 +169,19 @@ async function connectToWhatsApp() {
       })
 
       if (!found) {
-        console.log('Reserva no encontrada en la lista activa.')
         await sock.sendMessage(userJid, {
           text: 'Debe ir al live de @LiveSales y realizar su reserva.',
         })
         return
       }
 
-      console.log(`Reserva verificada exitosamente: ID ${found.id}`)
-
-      const realWhatsapp = userJid.split('@')[0]
       const priceNumber = parseFloat(found.product.price)
-
-      console.log(
-        `Procediendo a crear orden para cliente: ${found.tiktokUsername}, Telefono: ${realWhatsapp}`,
-      )
 
       const order = await createOrder({
         clientName: found.tiktokUsername,
         whatsapp: realWhatsapp,
         streamId: found.streamId,
+        tiktokUsername: found.tiktokUsername,
         items: [
           {
             productId: found.productId,
@@ -162,76 +192,77 @@ async function connectToWhatsApp() {
       })
 
       const currentOrderId = order.id
-      console.log(
-        `Orden #${currentOrderId} creada. Solicitando QR a Canela Bank y Cloudinary...`,
-      )
-
       const qrData = await generateQr(currentOrderId)
 
       const paymentInstructions =
         'Por favor realice el pago de su producto con el siguiente QR o ingresando al enlace de pago directo:\n' +
         `${qrData.qrUrl}\n\n` +
         '*NOTA: Tiene 5 minutos desde este momento para realizar su pago, caso contrario perdera la reserva.*\n\n' +
-        'Una vez realizado el pago por favor envie el comprobante de pago, en caso de no poder continuar con la compra, por favor escriba: Cancelar Reserva.'
+        'Una vez realizado el pago por favor envie la fotografía del comprobante. En caso de no poder continuar, escriba: Cancelar Reserva.'
 
       await sock.sendMessage(userJid, {
         image: { url: qrData.qrImageUrl },
         caption: paymentInstructions,
       })
 
-      console.log(`Imagen y texto enviados exitosamente a ${userJid}`)
-
       setTimeout(async () => {
         try {
-          await sock.sendMessage(userJid, {
-            text: 'Atencion le quedan 3 minutos para realizar el pago o perdera la reserva',
-          })
-        } catch (err) {
-          console.error('Error enviando primera notificacion:', err)
-        }
+          const current = await getPendingOrderByWhatsapp(realWhatsapp)
+          if (
+            current &&
+            current.id === currentOrderId &&
+            current.status === 'PENDING'
+          ) {
+            await sock.sendMessage(userJid, {
+              text: 'Atencion le quedan 3 minutos para realizar el pago o perdera la reserva',
+            })
+          }
+        } catch (err) {}
       }, firstNotificationMs)
 
       setTimeout(async () => {
         try {
-          await sock.sendMessage(userJid, {
-            text: 'Atencion le queda 1 minuto para realizar el pago o perdera la reserva',
-          })
-        } catch (err) {
-          console.error('Error enviando segunda notificacion:', err)
-        }
+          const current = await getPendingOrderByWhatsapp(realWhatsapp)
+          if (
+            current &&
+            current.id === currentOrderId &&
+            current.status === 'PENDING'
+          ) {
+            await sock.sendMessage(userJid, {
+              text: 'Atencion le queda 1 minuto para realizar el pago o perdera la reserva',
+            })
+          }
+        } catch (err) {}
       }, secondNotificationMs)
 
       setTimeout(async () => {
         try {
-          await sock.sendMessage(userJid, {
-            text: 'Perdio la reserva debido a que no realizo el pago en el tiempo establecido.',
-          })
-        } catch (err) {
-          console.error(
-            'Error enviando notificacion de perdida de reserva:',
-            err,
-          )
-        }
+          const current = await getPendingOrderByWhatsapp(realWhatsapp)
+          if (
+            current &&
+            current.id === currentOrderId &&
+            current.status === 'PENDING'
+          ) {
+            await sock.sendMessage(userJid, {
+              text: 'Perdio la reserva debido a que no realizo el pago en el tiempo establecido.',
+            })
+          }
+        } catch (err) {}
       }, reservationLostMs)
 
       setTimeout(async () => {
         try {
-          console.log(
-            `Tiempo limite alcanzado. Cancelando orden #${currentOrderId} en la API...`,
-          )
-          await updateOrderStatus(currentOrderId, 'CANCELLED')
-          console.log(
-            `Orden #${currentOrderId} cancelada exitosamente en la API.`,
-          )
-        } catch (err) {
-          console.error(
-            `Error cancelando la orden #${currentOrderId} en la API:`,
-            err,
-          )
-        }
+          const current = await getPendingOrderByWhatsapp(realWhatsapp)
+          if (
+            current &&
+            current.id === currentOrderId &&
+            current.status === 'PENDING'
+          ) {
+            await updateOrderStatus(currentOrderId, 'CANCELLED')
+          }
+        } catch (err) {}
       }, orderCancelMs)
     } catch (error) {
-      console.error('Error procesando el flujo de reserva y orden:', error)
       await sock.sendMessage(userJid, {
         text: 'Ocurrio un problema al procesar su orden. Por favor intenta mas tarde.',
       })

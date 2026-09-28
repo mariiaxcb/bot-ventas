@@ -29,12 +29,13 @@ export interface ReservationItem {
 export interface CreateOrderPayload {
   clientName: string
   whatsapp: string
-  streamId: number
-  items: {
+  streamId?: number
+  tiktokUsername?: string
+  items: Array<{
     productId: number
     quantity: number
     price: number
-  }[]
+  }>
 }
 
 export interface OrderResponseData {
@@ -201,4 +202,59 @@ export async function updateOrderStatus(
   }
 
   return response.json()
+}
+
+export async function getPendingOrderByWhatsapp(
+  whatsapp: string,
+): Promise<any> {
+  const buyerRes = await fetchWithAuth(`/buyers?search=${whatsapp}`)
+  const buyerData = await buyerRes.json()
+
+  if (!buyerData.data || buyerData.data.length === 0) return null
+
+  const buyerId = buyerData.data[0].id
+
+  const orderRes = await fetchWithAuth(
+    `/orders?buyerId=${buyerId}&status=PENDING`,
+  )
+  const orderData = await orderRes.json()
+
+  if (!orderData.data || orderData.data.length === 0) return null
+
+  return orderData.data[0]
+}
+
+export async function uploadReceipt(
+  orderId: number,
+  imageBuffer: Buffer,
+): Promise<any> {
+  if (!cachedToken) {
+    await login()
+  }
+
+  const formData = new FormData()
+  const blob = new Blob([new Uint8Array(imageBuffer)], { type: 'image/jpeg' })
+  formData.append('image', blob, 'receipt.jpg')
+
+  try {
+    const response = await fetch(`${API_BASE_URL}/orders/${orderId}/receipt`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${cachedToken}`,
+      },
+      body: formData as any,
+    })
+
+    const result = await response.json()
+
+    if (!response.ok) {
+      console.error('Error detallado devuelto por el backend:', result)
+      throw new Error(result.message || 'Error procesando el comprobante')
+    }
+
+    return result.data
+  } catch (err: any) {
+    console.error('Fallo crítico en fetch uploadReceipt:', err.message)
+    throw err
+  }
 }
