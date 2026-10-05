@@ -151,7 +151,7 @@ export async function createOrder(
   if (!response.ok) {
     console.error('Detalle error API createOrder:', JSON.stringify(result))
     throw new Error(
-      `Error al crear orden: ${response.status} - ${result.message || response.statusText}`,
+      `Error al crear orden: ${response.status} - ${result.mensaje ?? result.message ?? response.statusText}`,
     )
   }
 
@@ -249,7 +249,7 @@ export async function uploadReceipt(
 
     if (!response.ok) {
       console.error('Error detallado devuelto por el backend:', result)
-      throw new Error(result.message || 'Error procesando el comprobante')
+      throw new Error((result.mensaje ?? result.message) || 'Error procesando el comprobante')
     }
 
     return result.data

@@ -19,10 +19,57 @@ import {
   getPendingOrderByWhatsapp,
   uploadReceipt,
 } from './api.service.js'
+import {
+  setBotStatus,
+  iniciarApiBot,
+  borrarSesion,
+  type BotStatus,
+} from './botApi.js'
 
 dotenv.config()
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8080'
+const BOT_API_PORT = Number(process.env.BOT_API_PORT) || 3111
+
+/**
+ * El panel del vendedor puede cerrar la sesión de WhatsApp. Además de revocar
+ * el vínculo, borramos la sesión local: si no, Baileys volvería a conectarse
+ * con el mismo dispositivo sin pedir QR.
+ *
+ * Al terminar levantamos una conexión nueva para que el panel reciba un QR
+ * fresco y el vendedor pueda vincular otro número sin reiniciar el proceso.
+ */
+async function cerrarSesionWhatsApp(): Promise<void> {
+  const sock = globalSock
+  globalSock = null
+
+  if (sock) {
+    try {
+      await sock.logout()
+    } catch (error: any) {
+      // Si el dispositivo ya no existe en el servidor, seguimos con el
+      // borrado local que es lo que realmente importa aquí.
+      console.error('No se pudo revocar el vinculo en el servidor:', error?.message)
+    }
+  }
+
+  borrarSesion()
+  console.log('Sesion de WhatsApp cerrada. Generando un QR nuevo...')
+
+  // Damos un margen para que el socket anterior cierre del todo.
+  setTimeout(() => {
+    connectToWhatsApp()
+  }, 1500)
+}
+
+iniciarApiBot(BOT_API_PORT, {
+  onLogout: cerrarSesionWhatsApp,
+  onConnect: () => {
+    // Si el panel pide conectar y ya hay un socket vivo, no hacemos nada.
+    if (globalSock) return
+    connectToWhatsApp()
+  },
+})
 
 const firstNotificationMs = Number(process.env.FIRST_NOTIFICATION_MS) || 120000
 const secondNotificationMs =
@@ -51,6 +98,25 @@ function parseReservationMessage(
   return null
 }
 
+/**
+ * Traduce el error del backend a un mensaje que el comprador entienda.
+ *
+ * El backend ya devuelve un motivo concreto (referencia de otro pedido, monto
+ * menor, fecha fuera de rango). Aquí solo se ajusta el cierre: no siempre tiene
+ * sentido pedir una foto nueva cuando el problema es que el comprobante es de
+ * otra compra.
+ */
+function mensajeErrorComprobante(motivo: string): string {
+  const esReferenciaAjena =
+    /corresponde al pedido|este pedido es de|menciona el producto/i.test(motivo)
+
+  const cierre = esReferenciaAjena
+    ? 'Revisa que hayas pagado el QR de TU compra y vuelve a enviarlo.'
+    : 'Por favor verifica y envía la foto nuevamente, con la imagen completa y nitida.'
+
+  return `❌ No pudimos validar tu comprobante:\n\n${motivo}\n\n${cierre}`
+}
+
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
   const { version } = await fetchLatestBaileysVersion()
@@ -75,26 +141,42 @@ async function connectToWhatsApp() {
   sock.ev.on('creds.update', saveCreds)
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update
+    const { connection, lastDisconnect, qr, receivedPendingNotifications } =
+      update as typeof update & { receivedPendingNotifications?: unknown }
 
     if (qr) {
       console.log('CODIGO QR RECIBIDO:')
       qrcode.generate(qr, { small: true })
+      // El panel del vendedor lo muestra para escanearlo desde el navegador.
+      setBotStatus('QR_READY', { qr })
+    }
+
+    if (connection === 'connecting') {
+      setBotStatus('INITIALIZING')
     }
 
     if (connection === 'close') {
-      const shouldReconnect =
-        (lastDisconnect?.error as Boom)?.output?.statusCode !==
-        DisconnectReason.loggedOut
-      console.log('Conexion cerrada, reconectando:', shouldReconnect)
-      if (shouldReconnect) {
-        connectToWhatsApp()
+      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode
+      const cerradoPorLogout = statusCode === DisconnectReason.loggedOut
+
+      console.log('Conexion cerrada, reconectando:', !cerradoPorLogout)
+      setBotStatus('DISCONNECTED')
+
+      // Si el vendedor cerró sesión desde el panel, no reconectamos:
+      // debe volver a escanear un QR nuevo.
+      if (cerradoPorLogout) {
+        globalSock = null
+        console.log('Sesion cerrada. Vuelve a escanear el QR para conectar.')
+        return
       }
+
+      connectToWhatsApp()
     } else if (connection === 'open') {
       console.log('AUTENTICACION EXITOSA: Sesion iniciada.')
       console.log('CLIENTE LISTO: Bot escuchando mensajes.')
       // Asignar la conexión global para enviar mensajes inmediatos
       globalSock = sock
+      setBotStatus('CONNECTED', { qr: null })
       // Procesar mensajes pendientes cuando el bot se conecta
       processPendingMessages(sock)
     }
@@ -147,7 +229,7 @@ async function connectToWhatsApp() {
         })
       } catch (error: any) {
         await sock.sendMessage(userJid, {
-          text: `❌ Hubo un problema analizando tu comprobante:\n${error.message}\n\nPor favor verifica y envía la foto nuevamente.`,
+          text: mensajeErrorComprobante(error.message),
         })
       }
       return
