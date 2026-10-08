@@ -216,14 +216,186 @@ function parseReservationMessage(
   const userMatch = clean.match(userRegex)
   const productMatch = clean.match(productRegex)
 
-  // Si no hay ninguna de las dos etiquetas, no es un mensaje de reserva.
-  if (!userMatch && !productMatch) return null
+  // Sin etiquetas, se intenta deducir de los datos sueltos.
+  if (!userMatch && !productMatch) {
+    return parsearDatosSueltos(clean)
+  }
 
   return {
     username: userMatch
       ? userMatch[1].trim().toLowerCase().replace(/^@/, '')
       : null,
     productCode: productMatch ? productMatch[1].trim().toUpperCase() : null,
+  }
+}
+
+/**
+ * Un usuario de TikTok o un código de producto.
+ *
+ * Se admite un `@` inicial porque es habitual escribir "@pepito123". Se exige
+ * un mínimo de dos caracteres: un solo carácter casi siempre es un saludo
+ * ("h", "q") y no un dato.
+ */
+const RE_SOLO_DATOS = /^[A-Za-z0-9@][A-Za-z0-9._@-]{1,49}$/
+
+/**
+ * Palabras que no son datos, aunque el mensaje tenga dos tokens.
+ *
+ * Existe esta lista porque un usuario de TikTok y un código de producto tienen
+ * la misma forma: cualquier palabra de dos letras los cumple. Sin esta lista,
+ * "quiero el mouse" se interpretaría como usuario="quiero", código="MOUSE", y
+ * el bot respondería con un error de reserva en vez de preguntar los datos.
+ */
+const PALABRAS_NO_ES_DATOS = new Set([
+  // Saludos y cortesía
+  'hola',
+  'holis',
+  'buenas',
+  'buenos',
+  'buen',
+  'dias',
+  'gracias',
+  'ok',
+  'dale',
+  'porfa',
+  'favor',
+  'quisiera',
+  'podria',
+  'ayuda',
+  'help',
+  'info',
+  // Artículos, preposiciones y conectores: son la causa más común de un
+  // falso positivo ("quiero el mouse" -> "el" como usuario).
+  'el',
+  'la',
+  'los',
+  'las',
+  'un',
+  'una',
+  'unos',
+  'unas',
+  'de',
+  'del',
+  'y',
+  'o',
+  'que',
+  'para',
+  'con',
+  'por',
+  'en',
+  'es',
+  'son',
+  'mi',
+  'mis',
+  'su',
+  'sus',
+  'a',
+  'al',
+  'me',
+  'te',
+  'se',
+  'pregunta',
+  'duda',
+  'consulta',
+  'sobre',
+  // Afirmaciones
+  'si',
+  'no',
+  'esta',
+  'este',
+  'esto',
+  'estoy',
+  'tambien',
+  'mismo',
+  // Verbos y sustantivos de una intención
+  'quiero',
+  'quieren',
+  'queremos',
+  'tengo',
+  'tienen',
+  'necesito',
+  'necesita',
+  'busco',
+  'buscas',
+  'comprar',
+  'compra',
+  'comprando',
+  'pedido',
+  'pedir',
+  'pido',
+  'precio',
+  'precios',
+  'cuanto',
+  'cuesta',
+  'vale',
+  'hay',
+  'tiene',
+  'manda',
+  'mande',
+  'envia',
+  'enviar',
+  'aqui',
+  'alla',
+  'ahora',
+  'despues',
+  'antes',
+  'luego',
+  'otro',
+  'otra',
+  // Nombres de producto comunes: el comprador los escribe en vez del código
+  'camisa',
+  'camisas',
+  'pantalon',
+  'pantalones',
+  'mouse',
+  'teclado',
+  'monitor',
+  'zapato',
+  'zapatos',
+  'reloj',
+  'bolso',
+  'ropa',
+  // Acciones sobre la reserva
+  'cancelar',
+  'cancelado',
+  'eliminar',
+  'anular',
+])
+
+/**
+ * Interpreta un mensaje sin etiquetas.
+ *
+ * Los compradores no siempre copian el formato. Es común que escriban solo
+ * "Rashad_barra MIO123" en dos líneas, con el usuario arriba y el producto
+ * abajo. Cuando llegan exactamente dos datos, se toma el primero como usuario y
+ * el segundo como código.
+ *
+ * Solo se acepta si AMBOS parecen datos. Si el mensaje trae dos palabras en
+ * idioma natural ("hola gracias") se rechaza, porque ahí adivinar convertiría
+ * una conversación normal en datos de reserva.
+ */
+function parsearDatosSueltos(
+  clean: string,
+): { username: string | null; productCode: string | null } | null {
+  const partes = clean
+    .split(/[\s,;|]+/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+
+  if (partes.length === 0 || partes.length > 2) return null
+
+  // Se filtran los saludos: "Hola, Rashad_Barra MIO123" deja tres tokens, y el
+  // tercero sigue siendo el dato importante.
+  const datos = partes.filter(
+    (p) => !PALABRAS_NO_ES_DATOS.has(p.toLowerCase()),
+  )
+
+  if (datos.length === 0 || datos.length > 2) return null
+  if (!datos.every((p) => RE_SOLO_DATOS.test(p))) return null
+
+  return {
+    username: datos[0] ? limpiarUsername(datos[0]) : null,
+    productCode: datos[1] ? datos[1].toUpperCase() : null,
   }
 }
 
@@ -526,9 +698,11 @@ async function connectToWhatsApp() {
 
     const parsedData = parseReservationMessage(incomingText)
 
-    // Mensaje que no trae datos de reserva: se explica el formato en dos
+    // Mensaje que no trae datos de reserva: se explica el formato en tres
     // mensajes. Se separa porque en un solo bloque el celular lo muestra como
-    // un párrafo largo y el cliente no distingue qué tiene que responder.
+    // un párrafo largo y el cliente no distingue qué tiene que responder. El
+    // ejemplo va al final porque es lo que de verdad le dice al comprador
+    // cómo se ve un mensaje correcto.
     if (!parsedData) {
       await sock.sendMessage(userJid, {
         text: 'Gracias por comunicarte con Tienda LiveSales, Si realizaste una reserva por tiktok, por favor envianos la siguiente informacion en este formato:',
@@ -536,6 +710,10 @@ async function connectToWhatsApp() {
 
       await sock.sendMessage(userJid, {
         text: 'nombre de usuario:\ncodigo de producto:',
+      })
+
+      await sock.sendMessage(userJid, {
+        text: 'Por ejemplo:\n\nnombre de usuario: pepito123\ncodigo de producto: mouseX6',
       })
 
       return
