@@ -29,6 +29,17 @@ import {
   registrarPeticionConexion,
   SESSION_DIR,
 } from './botApi.js'
+import {
+  esSolicitudDeCancelacion,
+  limpiarUsername,
+  mencionaTiktok,
+  parseReservationMessage,
+  quitarPalabraTiktok,
+} from './parser.js'
+import {
+  mensajesParaPedirDatos,
+  mensajesReservaPerdida,
+} from './mensajes.js'
 
 dotenv.config()
 
@@ -190,32 +201,13 @@ const CONVERSACION_TTL_MS = 30 * 60 * 1000
 /** numeroDeWhatsapp -> momento del último mensaje que mencionó TikTok. */
 const ultimoTikTok = new Map<string, number>()
 
-/** Normaliza texto para buscar palabras ignorando acentos y mayúsculas. */
-function normalizar(texto: string): string {
-  return texto
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-}
-
-/** ¿El mensaje menciona TikTok? Es la palabra que abre el flujo. */
-function mencionaTiktok(text: string): boolean {
-  return normalizar(text).includes('tiktok')
-}
-
 /**
- * Quita las apariciones sueltas de "tiktok" del mensaje.
+ * Intentos fallidos de obtener los datos de la reserva, por persona.
  *
- * La palabra abre el flujo pero no es un dato de la reserva. Sin quitarla, un
- * mensaje que solo dice "Tiktok" se interpreta como nombre de usuario y el bot
- * termina pidiendo únicamente el código de producto.
- *
- * Solo se quitan palabras completas: en un usuario como "tiktok_shop" el
- * "tiktok" forma parte del nombre y debe quedarse.
+ * Lleva la cuenta para no repetir siempre el mismo mensaje. Se limpia en
+ * cuanto llegan los datos, y también cuando se cancela la reserva.
  */
-function quitarPalabraTiktok(text: string): string {
-  return text.replace(/\btiktok\b/gi, ' ').replace(/\s+/g, ' ').trim()
-}
+const intentosDatos = new Map<string, number>()
 
 /**
  * ¿Seguimos en conversación con esta persona?
@@ -240,237 +232,43 @@ function enConversacion(numero: string): boolean {
 /** Cierra el flujo con esta persona: vuelve a pedir "tiktok" para reabrirlo. */
 function cerrarConversacion(numero: string): void {
   ultimoTikTok.delete(numero)
+  intentosDatos.delete(numero)
+  estadoEnCurso.delete(numero)
 }
 
 /**
- * Detecta si el cliente quiere cancelar su reserva.
+ * Pide los datos de la reserva, escalando el mensaje según el intento.
  *
- * Acepta varias formas porque el comprador escribe como le sale: "Cancelar
- * Reserva", "cancelar reserva", "cancelar" o "ya no quiero el producto".
- */
-function esSolicitudDeCancelacion(text: string): boolean {
-  const limpio = normalizar(text)
-    .replace(/[^\p{L}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  if (limpio.includes('cancelar reserva')) return true
-  if (limpio === 'cancelar' || limpio === 'cancelar por favor') return true
-  if (limpio.includes('ya no quiero')) return true
-
-  return false
-}
-
-/**
- * Parsea los datos de la reserva.
+ * Se usa en los dos casos en que faltan datos: cuando no llegó nada legible y
+ * cuando llegó solo uno de los dos campos. En ambos se recuerda SIEMPRE el
+ * formato completo.
  *
- * Acepta los dos campos juntos o por separado: en WhatsApp es habitual que el
- * comprador escriba "nombre de usuario: pepito123", espere el QR y luego
- * mande "codigo de producto: mouseX6" al ver que el bot pide los dos. Rechazar
- * el segundo mensaje dejaria al cliente sin poder comprar.
+ * Importante: nunca se pide un único campo. Si el comprador mandó solo el
+ * usuario y el bot responde "ahora envia el codigo de producto", el comprador
+ * contesta con el código, el bot lo toma como usuario nuevo y la reserva nunca
+ * se encuentra: el flujo se queda dando vueltas sin llegar al QR. Recordar el
+ * formato completo cada vez cierra ese bucle, porque el comprador reenvía los
+ * dos datos juntos.
+ *
+ * El saludo completo se manda UNA sola vez: en el mensaje que abre el flujo con
+ * "tiktok". Después, seguir saludando como si fuera la primera vez hace que el
+ * comprador piense que el bot no leyó nada y termine escribiendo cualquier cosa.
+ *
+ * El mensaje también cambia con cada intento: repetir el mismo texto tres veces
+ * seguidas hace pensar que el bot se trabó, y el comprador abandona la compra.
  */
-function parseReservationMessage(
-  text: string,
-): { username: string | null; productCode: string | null } | null {
-  const clean = text.trim()
-  const userRegex = /(?:nombre\s*de\s*usuario|usuario|user)\s*:\s*([^\n\r]+)/i
-  const productRegex =
-    /(?:codigo\s*de\s*producto|producto|codigo)\s*:\s*([^\n\r]+)/i
+async function pedirDatosDeReserva(
+  sock: any,
+  userJid: string,
+  numero: string,
+  abreElFlujo: boolean,
+): Promise<void> {
+  const vecesPreguntado = intentosDatos.get(numero) ?? 0
+  intentosDatos.set(numero, vecesPreguntado + 1)
 
-  const userMatch = clean.match(userRegex)
-  const productMatch = clean.match(productRegex)
-
-  // Sin etiquetas, se intenta deducir de los datos sueltos.
-  if (!userMatch && !productMatch) {
-    return parsearDatosSueltos(clean)
+  for (const texto of mensajesParaPedirDatos(vecesPreguntado, abreElFlujo)) {
+    await sock.sendMessage(userJid, { text: texto })
   }
-
-  return {
-    username: userMatch
-      ? userMatch[1].trim().toLowerCase().replace(/^@/, '')
-      : null,
-    productCode: productMatch ? productMatch[1].trim().toUpperCase() : null,
-  }
-}
-
-/**
- * Un usuario de TikTok o un código de producto.
- *
- * Se admite un `@` inicial porque es habitual escribir "@pepito123". Se exige
- * un mínimo de dos caracteres: un solo carácter casi siempre es un saludo
- * ("h", "q") y no un dato.
- */
-const RE_SOLO_DATOS = /^[A-Za-z0-9@][A-Za-z0-9._@-]{1,49}$/
-
-/**
- * Palabras que no son datos, aunque el mensaje tenga dos tokens.
- *
- * Existe esta lista porque un usuario de TikTok y un código de producto tienen
- * la misma forma: cualquier palabra de dos letras los cumple. Sin esta lista,
- * "quiero el mouse" se interpretaría como usuario="quiero", código="MOUSE", y
- * el bot respondería con un error de reserva en vez de preguntar los datos.
- */
-const PALABRAS_NO_ES_DATOS = new Set([
-  // Saludos y cortesía
-  'hola',
-  'holis',
-  'buenas',
-  'buenos',
-  'buen',
-  'dias',
-  'gracias',
-  'ok',
-  'dale',
-  'porfa',
-  'favor',
-  'quisiera',
-  'podria',
-  'ayuda',
-  'help',
-  'info',
-  // Artículos, preposiciones y conectores: son la causa más común de un
-  // falso positivo ("quiero el mouse" -> "el" como usuario).
-  'el',
-  'la',
-  'los',
-  'las',
-  'un',
-  'una',
-  'unos',
-  'unas',
-  'de',
-  'del',
-  'y',
-  'o',
-  'que',
-  'para',
-  'con',
-  'por',
-  'en',
-  'es',
-  'son',
-  'mi',
-  'mis',
-  'su',
-  'sus',
-  'a',
-  'al',
-  'me',
-  'te',
-  'se',
-  'pregunta',
-  'duda',
-  'consulta',
-  'sobre',
-  // Afirmaciones
-  'si',
-  'no',
-  'esta',
-  'este',
-  'esto',
-  'estoy',
-  'tambien',
-  'mismo',
-  // Verbos y sustantivos de una intención
-  'quiero',
-  'quieren',
-  'queremos',
-  'tengo',
-  'tienen',
-  'necesito',
-  'necesita',
-  'busco',
-  'buscas',
-  'comprar',
-  'compra',
-  'comprando',
-  'pedido',
-  'pedir',
-  'pido',
-  'precio',
-  'precios',
-  'cuanto',
-  'cuesta',
-  'vale',
-  'hay',
-  'tiene',
-  'manda',
-  'mande',
-  'envia',
-  'enviar',
-  'aqui',
-  'alla',
-  'ahora',
-  'despues',
-  'antes',
-  'luego',
-  'otro',
-  'otra',
-  // Nombres de producto comunes: el comprador los escribe en vez del código
-  'camisa',
-  'camisas',
-  'pantalon',
-  'pantalones',
-  'mouse',
-  'teclado',
-  'monitor',
-  'zapato',
-  'zapatos',
-  'reloj',
-  'bolso',
-  'ropa',
-  // Acciones sobre la reserva
-  'cancelar',
-  'cancelado',
-  'eliminar',
-  'anular',
-])
-
-/**
- * Interpreta un mensaje sin etiquetas.
- *
- * Los compradores no siempre copian el formato. Es común que escriban solo
- * "Rashad_barra MIO123" en dos líneas, con el usuario arriba y el producto
- * abajo. Cuando llegan exactamente dos datos, se toma el primero como usuario y
- * el segundo como código.
- *
- * Solo se acepta si AMBOS parecen datos. Si el mensaje trae dos palabras en
- * idioma natural ("hola gracias") se rechaza, porque ahí adivinar convertiría
- * una conversación normal en datos de reserva.
- */
-function parsearDatosSueltos(
-  clean: string,
-): { username: string | null; productCode: string | null } | null {
-  const partes = clean
-    .split(/[\s,;|]+/)
-    .map((p) => p.trim())
-    .filter(Boolean)
-
-  if (partes.length === 0 || partes.length > 2) return null
-
-  // Se filtran los saludos: "Hola, Rashad_Barra MIO123" deja tres tokens, y el
-  // tercero sigue siendo el dato importante.
-  const datos = partes.filter(
-    (p) => !PALABRAS_NO_ES_DATOS.has(p.toLowerCase()),
-  )
-
-  if (datos.length === 0 || datos.length > 2) return null
-  if (!datos.every((p) => RE_SOLO_DATOS.test(p))) return null
-
-  return {
-    username: datos[0] ? limpiarUsername(datos[0]) : null,
-    productCode: datos[1] ? datos[1].toUpperCase() : null,
-  }
-}
-
-/**
- * Convierte el texto en algo presentable como nombre de usuario.
- *
- * Se quita el @ y se pasan a minúsculas porque así es como el backend guarda
- * la reserva; sin esto, "pepito123" y "@Pepito123" no casarían.
- */
-function limpiarUsername(valor: string): string {
-  return valor.trim().replace(/^@/, '').toLowerCase()
 }
 
 /**
@@ -770,7 +568,10 @@ async function connectToWhatsApp() {
     // El flujo solo arranca si el mensaje menciona TikTok. Sin esto el bot
     // responde a cualquier saludo ("Hi", "Hola") y termina pidiendo datos de
     // reserva a quien solo está saludando.
-    if (!enConversacion(realWhatsapp)) {
+    const flujoAbierto = enConversacion(realWhatsapp)
+    const abreElFlujo = !flujoAbierto
+
+    if (abreElFlujo) {
       if (!mencionaTiktok(incomingText)) {
         console.log(`Mensaje sin "tiktok" de ${realWhatsapp}: se ignora.`)
         return
@@ -790,56 +591,34 @@ async function connectToWhatsApp() {
 
     const parsedData = parseReservationMessage(sinPalabraApertura)
 
-    // Mensaje que no trae datos de reserva: se explica el formato en tres
-    // mensajes. Se separa porque en un solo bloque el celular lo muestra como
-    // un párrafo largo y el cliente no distingue qué tiene que responder. El
-    // ejemplo va al final porque es lo que de verdad le dice al comprador
-    // cómo se ve un mensaje correcto.
-    if (!parsedData) {
-      await sock.sendMessage(userJid, {
-        text: 'Gracias por comunicarte con Tienda LiveSales, Si realizaste una reserva por tiktok, por favor envianos la siguiente informacion en este formato:',
-      })
-
-      await sock.sendMessage(userJid, {
-        text: 'nombre de usuario:\ncodigo de producto:',
-      })
-
-      await sock.sendMessage(userJid, {
-        text: 'Por ejemplo:\n\nnombre de usuario: pepito123\ncodigo de producto: mouseX6',
-      })
-
-      return
-    }
-
-    // Llegó solo uno de los dos campos. Guardamos el que vino y pedimos el
-    // otro, para que el comprador pueda mandarlos en mensajes separados.
-    const { username, productCode } = parsedData
+    // Faltan datos: no llegó nada legible, o llegó solo uno de los dos campos.
+    //
+    // Se guarda lo que vino, pero NO se pide solo el campo que falta: se
+    // recuerda el formato completo. Pedir un único campo hacía que el comprador
+    // respondiera con un solo dato, el bot lo tomara como el otro campo, y la
+    // reserva nunca se encontrara.
+    //
+    // El contador NO se reinicia aquí a propósito. Si se reiniciara al llegar
+    // un dato suelto, el siguiente mensaje volvería al saludo inicial, que es
+    // lo que hace pensar al comprador que el bot se reinició solo.
+    const username = parsedData?.username ?? null
+    const productCode = parsedData?.productCode ?? null
 
     if (!username || !productCode) {
-      estadoEnCurso.set(realWhatsapp, {
-        username: username ?? estadoEnCurso.get(realWhatsapp)?.username ?? '',
-        productCode:
-          productCode ?? estadoEnCurso.get(realWhatsapp)?.productCode ?? '',
-      })
+      if (username || productCode) {
+        estadoEnCurso.set(realWhatsapp, {
+          username: username ?? estadoEnCurso.get(realWhatsapp)?.username ?? '',
+          productCode:
+            productCode ?? estadoEnCurso.get(realWhatsapp)?.productCode ?? '',
+        })
+      }
 
-      await sock.sendMessage(userJid, {
-        text: username
-          ? 'Gracias. Ahora envia el codigo de producto en este formato:\n\ncodigo de producto:'
-          : 'Gracias. Ahora envia tu nombre de usuario en este formato:\n\nnombre de usuario:',
-      })
-
-      // El ejemplo va también aquí. Pedir solo el campo que falta, sin mostrar
-      // cómo se ve un mensaje completo, deja al comprador adivinando el
-      // formato y es justo lo que hizo que el flujo se trabara.
-      await sock.sendMessage(userJid, {
-        text:
-          username
-            ? 'Por ejemplo:\n\ncodigo de producto: mouseX6'
-            : 'Por ejemplo:\n\nnombre de usuario: pepito123',
-      })
-
+      await pedirDatosDeReserva(sock, userJid, realWhatsapp, abreElFlujo)
       return
     }
+
+    // Llegaron los dos datos: el contador ya no aplica.
+    intentosDatos.delete(realWhatsapp)
 
     try {
       const reservations = await getActiveReservations()
@@ -962,10 +741,18 @@ async function connectToWhatsApp() {
             current.id === currentOrderId &&
             current.status === 'PENDING'
           ) {
-            await sock.sendMessage(userJid, {
-              text: 'Perdio la reserva debido a que no realizo el pago en el tiempo establecido.',
-            })
-          }
+            for (const texto of mensajesReservaPerdida()) {
+              await sock.sendMessage(userJid, { text: texto })
+            }
+
+            // La reserva se perdio, asi que el ciclo con este comprador
+            // termina aqui. El bot queda mudo y solo vuelve a responder si
+            // escribe "tiktok", que es la palabra con la que se abre el flujo.
+            //
+            // Si se dejara abierto, el comprador responderia cualquier cosa
+            // ("hola", "ya pague") y el bot le pediria los datos de una reserva
+            // que ya no existe, sin llegar nunca a nada.
+            cerrarConversacion(realWhatsapp)          }
         } catch (err) {}
       }, reservationLostMs)
 
