@@ -128,6 +128,7 @@ async function cancelarReserva(sock: any, userJid: string): Promise<void> {
     if (reserva) {
       await cancelReservation(reserva.id)
       estadoEnCurso.delete(numero)
+      cerrarConversacion(numero)
 
       await sock.sendMessage(userJid, {
         text:
@@ -156,6 +157,7 @@ async function cancelarReserva(sock: any, userJid: string): Promise<void> {
 
     await updateOrderStatus(orden.id, 'CANCELLED')
     estadoEnCurso.delete(numero)
+    cerrarConversacion(numero)
 
     await sock.sendMessage(userJid, {
       text:
@@ -176,16 +178,64 @@ async function cancelarReserva(sock: any, userJid: string): Promise<void> {
 }
 
 /**
+ * Ventana durante la que el bot sigue respondiendo a una persona.
+ *
+ * Es lo que permite que el comprador escriba "nombre de usuario: pepito123"
+ * después de haber dicho "tiktok", sin tener que repetir la palabra en cada
+ * mensaje. media hora es suficiente para el flujo completo (reserva, QR, pago y
+ * confirmación) y evita que el número quede respondiendo semanas después.
+ */
+const CONVERSACION_TTL_MS = 30 * 60 * 1000
+
+/** numeroDeWhatsapp -> momento del último mensaje que mencionó TikTok. */
+const ultimoTikTok = new Map<string, number>()
+
+/** Normaliza texto para buscar palabras ignorando acentos y mayúsculas. */
+function normalizar(texto: string): string {
+  return texto
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+}
+
+/** ¿El mensaje menciona TikTok? Es la palabra que abre el flujo. */
+function mencionaTiktok(text: string): boolean {
+  return normalizar(text).includes('tiktok')
+}
+
+/**
+ * ¿Seguimos en conversación con esta persona?
+ *
+ * Si la última vez que mencionó TikTok fue hace poco, el flujo sigue abierto y
+ * el bot responde sin volver a exigir la palabra. Pasada la ventana, se olvida
+ * y el próximo mensaje vuelve a necesitar "tiktok".
+ */
+function enConversacion(numero: string): boolean {
+  const ultimo = ultimoTikTok.get(numero)
+
+  if (!ultimo) return false
+
+  if (Date.now() - ultimo > CONVERSACION_TTL_MS) {
+    ultimoTikTok.delete(numero)
+    return false
+  }
+
+  return true
+}
+
+/** Cierra el flujo con esta persona: vuelve a pedir "tiktok" para reabrirlo. */
+function cerrarConversacion(numero: string): void {
+  ultimoTikTok.delete(numero)
+}
+
+/**
  * Detecta si el cliente quiere cancelar su reserva.
  *
  * Acepta varias formas porque el comprador escribe como le sale: "Cancelar
  * Reserva", "cancelar reserva", "cancelar" o "ya no quiero el producto".
  */
 function esSolicitudDeCancelacion(text: string): boolean {
-  const limpio = text
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
+  const limpio = normalizar(text)
     .replace(/[^\p{L}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim()
@@ -688,12 +738,36 @@ async function connectToWhatsApp() {
 
     if (!incomingText) return
 
-    // "Cancelar Reserva" tiene prioridad sobre todo lo demás: si el cliente
-    // está arrepentido, no querés que el bot intente interpretarlo como datos
-    // de una reserva nueva.
+    // Cancelar Reserva tiene prioridad: si el cliente está arrepentido, no
+    // querés que el bot intente interpretarlo como datos de una reserva nueva.
+    // Funciona sin decir "tiktok" porque el flujo ya está abierto.
     if (esSolicitudDeCancelacion(incomingText)) {
+      if (!enConversacion(realWhatsapp)) {
+        console.log(
+          `Cancelacion sin flujo abierto de ${realWhatsapp}: se ignora.`,
+        )
+        return
+      }
+
       await cancelarReserva(sock, userJid)
       return
+    }
+
+    // El flujo solo arranca si el mensaje menciona TikTok. Sin esto el bot
+    // responde a cualquier saludo ("Hi", "Hola") y termina pidiendo datos de
+    // reserva a quien solo está saludando.
+    if (!enConversacion(realWhatsapp)) {
+      if (!mencionaTiktok(incomingText)) {
+        console.log(
+          `Mensaje sin "tiktok" de ${realWhatsapp}: se ignora.`,
+        )
+        return
+      }
+
+      ultimoTikTok.set(realWhatsapp, Date.now())
+    } else {
+      // Cada mensaje renueva la ventana: el comprador puede escribir despacio.
+      ultimoTikTok.set(realWhatsapp, Date.now())
     }
 
     const parsedData = parseReservationMessage(incomingText)
@@ -776,8 +850,9 @@ async function connectToWhatsApp() {
         return
       }
 
-      // La reserva quedó confirmada: ya no tiene sentido cancelarla desde el
-      // chat, así que se limpia el estado a medio camino.
+      // La reserva quedó confirmada y ya no hace falta pedir "tiktok" otra vez:
+      // el comprador está en la etapa de pago y comprobante. La ventana se
+      // mantiene viva porque el pago y el OCR ocurren después de este mensaje.
       estadoEnCurso.delete(realWhatsapp)
 
       const priceNumber = parseFloat(found.product.price)
