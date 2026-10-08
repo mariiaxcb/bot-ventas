@@ -21,9 +21,11 @@ import {
 } from './api.service.js'
 import {
   setBotStatus,
+  getBotState,
   iniciarApiBot,
   borrarSesion,
-  type BotStatus,
+  registrarPeticionConexion,
+  SESSION_DIR,
 } from './botApi.js'
 
 dotenv.config()
@@ -32,16 +34,28 @@ const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8080'
 const BOT_API_PORT = Number(process.env.BOT_API_PORT) || 3111
 
 /**
- * El panel del vendedor puede cerrar la sesión de WhatsApp. Además de revocar
- * el vínculo, borramos la sesión local: si no, Baileys volvería a conectarse
- * con el mismo dispositivo sin pedir QR.
+ * Cierre de sesión a pedido del vendedor.
  *
- * Al terminar levantamos una conexión nueva para que el panel reciba un QR
- * fresco y el vendedor pueda vincular otro número sin reiniciar el proceso.
+ * Además de revocar el vínculo con WhatsApp, borramos la sesión local: si no,
+ * Baileys vuelve a conectarse con el mismo dispositivo sin pedir QR.
+ *
+ * Baileys no garantiza el orden entre `logout()` y el evento `close`, así que
+ * marcamos el cierre como intencionado ANTES de llamar a logout. Sin esa
+ * bandera, el evento `close` se interpreta como una caída y dispara la
+ * reconexión automática, que compite con la conexión nueva y termina
+ * consumiéndose entre sockets: el panel acaba siempre en "no hay QR".
  */
+let cierreIntencionado = false
+
 async function cerrarSesionWhatsApp(): Promise<void> {
-  const sock = globalSock
+  cierreIntencionado = true
+
+  // Si hay una reconexión pendiente, la cancelamos: ahora manda el cierre.
+  cancelarReconexion()
+
+  const sock = globalSock ?? socketActivo
   globalSock = null
+  socketActivo = null
 
   if (sock) {
     try {
@@ -58,16 +72,18 @@ async function cerrarSesionWhatsApp(): Promise<void> {
 
   // Damos un margen para que el socket anterior cierre del todo.
   setTimeout(() => {
-    connectToWhatsApp()
+    if (!cierreIntencionado) return
+    conectar()
   }, 1500)
 }
 
 iniciarApiBot(BOT_API_PORT, {
   onLogout: cerrarSesionWhatsApp,
   onConnect: () => {
-    // Si el panel pide conectar y ya hay un socket vivo, no hacemos nada.
-    if (globalSock) return
-    connectToWhatsApp()
+    // El panel pide un QR nuevo. Si ya hay un socket vivo, cerramos el
+    // anterior antes de crear otro: dos sockets sobre la misma sesión en
+    // disco se expulsan mutuamente y el QR se pierde en el proceso.
+    reiniciarConexion()
   },
 })
 
@@ -117,70 +133,207 @@ function mensajeErrorComprobante(motivo: string): string {
   return `❌ No pudimos validar tu comprobante:\n\n${motivo}\n\n${cierre}`
 }
 
+/**
+ * Estado de la conexión con WhatsApp.
+ *
+ * Antes estas piezas vivían sueltas y se pisaban entre sí:
+ *  - `conectandoEnCurso` evita abrir dos sockets a la vez.
+ *  - `socketActivo` referencia el socket aunque todavía no esté autenticado
+ *    (es decir, mientras espera el QR), que es justo el estado en el que el
+ *    vendedor pide un QR nuevo.
+ *  - `intentosReconexion` evita un bucle infinito de reconexiones cuando
+ *    WhatsApp rechaza la sesión de forma persistente.
+ */
+let conectandoEnCurso = false
+let socketActivo: any = null
+let intentosReconexion = 0
+const MAX_INTENTOS_RECONEXION = 5
+
+/** Cierra el socket anterior y limpia sus listeners. */
+function cerrarSocket(sock: any): void {
+  if (!sock) return
+
+  try {
+    // Sin esto, el socket viejo sigue emitiendo eventos y sobreescribe el
+    // estado del panel con su propio QR, ya obsoleto.
+    sock.ev?.removeAllListeners?.('connection.update')
+    sock.ev?.removeAllListeners?.('creds.update')
+    sock.ev?.removeAllListeners?.('messages.upsert')
+  } catch {
+    // Un socket ya caído puede lanzar aquí; es esperado y no es grave.
+  }
+
+  try {
+    sock.end?.(undefined)
+  } catch {
+    // Likewise: si ya estaba cerrado, no hay nada que hacer.
+  }
+}
+
+/**
+ * Reinicia la conexión desde cero.
+ *
+ * Es lo que llama el panel cuando el vendedor pide un QR nuevo y no aparece
+ * ninguno. Cierra cualquier socket vivo (para que no compitan por la sesión
+ * en disco) y abre uno limpio.
+ */
+function reiniciarConexion(): void {
+  if (conectandoEnCurso) {
+    console.log('Hay una conexion en curso; se espera a que termine.')
+    return
+  }
+
+  console.log('Reiniciando la conexion para obtener un QR nuevo.')
+
+  if (globalSock) {
+    cerrarSocket(globalSock)
+    globalSock = null
+  }
+  if (socketActivo) {
+    cerrarSocket(socketActivo)
+    socketActivo = null
+  }
+
+  // La sesión ya no sirve si estamos pidiendo un QR: sin esto Baileys
+  // intentaría reconectar con el dispositivo anterior en vez de mostrar QR.
+  borrarSesion()
+  intentosReconexion = 0
+
+  setBotStatus('INITIALIZING', { qr: null })
+  marcarAperturaDeSesion()
+  conectar()
+}
+
+/**
+ * El panel pide un QR: aquí es donde se decide si hace falta una conexión
+ * nueva o si el QR vigente todavía sirve.
+ */
+registrarPeticionConexion(() => {
+  // Si ya tenemos un QR en pantalla, WhatsApp lo renueva solo. Reiniciar
+  // obligaría al vendedor a escanear algo que ya tenía delante.
+  if (getBotState().qr) return
+
+  console.log('El panel solicito un QR.')
+  reiniciarConexion()
+})
+
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
-  const { version } = await fetchLatestBaileysVersion()
-  const logger = pino({ level: 'silent' })
+  // Si ya hay una conexión en curso, no abrimos otra. Dos sockets escribiendo
+  // sobre el mismo archivo de sesión se expulsan mutuamente, y el QR que
+  // muestra el panel termina siendo el de un socket que ya no existe.
+  if (conectandoEnCurso) {
+    console.log('Conexion en curso, no se abre otra.')
+    return
+  }
 
-  const sock = makeWASocket({
-    version,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    printQRInTerminal: false,
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    browser: ['LiveSales', 'Chrome', '10.0.0'],
-    logger,
-    getMessage: async () => undefined,
-    shouldIgnoreJid: (jid) =>
-      jid.endsWith('@g.us') || jid.endsWith('@broadcast'),
-  })
+  conectandoEnCurso = true
 
-  sock.ev.on('creds.update', saveCreds)
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR)
+    const { version } = await fetchLatestBaileysVersion()
+    const logger = pino({ level: 'silent' })
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr, receivedPendingNotifications } =
-      update as typeof update & { receivedPendingNotifications?: unknown }
+    const sock = makeWASocket({
+      version,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      printQRInTerminal: false,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      browser: ['LiveSales', 'Chrome', '10.0.0'],
+      logger,
+      getMessage: async () => undefined,
+      shouldIgnoreJid: (jid) =>
+        jid.endsWith('@g.us') || jid.endsWith('@broadcast'),
+    })
 
-    if (qr) {
-      console.log('CODIGO QR RECIBIDO:')
-      qrcode.generate(qr, { small: true })
-      // El panel del vendedor lo muestra para escanearlo desde el navegador.
-      setBotStatus('QR_READY', { qr })
-    }
+    socketActivo = sock
 
-    if (connection === 'connecting') {
-      setBotStatus('INITIALIZING')
-    }
+    sock.ev.on('creds.update', saveCreds)
 
-    if (connection === 'close') {
-      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode
-      const cerradoPorLogout = statusCode === DisconnectReason.loggedOut
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr, receivedPendingNotifications } =
+        update as typeof update & { receivedPendingNotifications?: unknown }
 
-      console.log('Conexion cerrada, reconectando:', !cerradoPorLogout)
-      setBotStatus('DISCONNECTED')
-
-      // Si el vendedor cerró sesión desde el panel, no reconectamos:
-      // debe volver a escanear un QR nuevo.
-      if (cerradoPorLogout) {
-        globalSock = null
-        console.log('Sesion cerrada. Vuelve a escanear el QR para conectar.')
-        return
+      if (qr) {
+        console.log('CODIGO QR RECIBIDO:')
+        qrcode.generate(qr, { small: true })
+        // Hay un QR en pantalla, así que el ciclo de vinculación vuelve a ser
+        // normal: cualquier cierre posterior debe reconectar con normalidad.
+        cierreIntencionado = false
+        // El panel del vendedor lo muestra para escanearlo desde el navegador.
+        setBotStatus('QR_READY', { qr })
       }
 
-      connectToWhatsApp()
-    } else if (connection === 'open') {
-      console.log('AUTENTICACION EXITOSA: Sesion iniciada.')
-      console.log('CLIENTE LISTO: Bot escuchando mensajes.')
-      // Asignar la conexión global para enviar mensajes inmediatos
-      globalSock = sock
-      setBotStatus('CONNECTED', { qr: null })
-      // Procesar mensajes pendientes cuando el bot se conecta
-      processPendingMessages(sock)
-    }
-  })
+      if (connection === 'connecting') {
+        // No se pisa un QR que ya tenemos: WhatsApp lo renueva por su cuenta y
+        // el panel sigue mostrando el último válido.
+        if (!getBotState().qr) setBotStatus('INITIALIZING')
+      }
+
+      if (connection === 'close') {
+        const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode
+        const cerradoPorLogout = statusCode === DisconnectReason.loggedOut
+
+        // Este socket ya no sirve, pero puede que haya otro en marcha.
+        if (socketActivo === sock) socketActivo = null
+        if (globalSock === sock) globalSock = null
+
+        // El cierre intencionado ya tiene su propio flujo en
+        // cerrarSesionWhatsApp: reconectar aquí competiría con ese QR.
+        if (cierreIntencionado) {
+          console.log('Cierre de sesion confirmado.')
+          return
+        }
+
+        console.log('Conexion cerrada, reconectando:', !cerradoPorLogout)
+        setBotStatus('DISCONNECTED')
+
+        if (cerradoPorLogout) {
+          // WhatsApp invalido la sesion por su cuenta: el vendedor desvinculo
+          // el dispositivo desde el celular, o la credencial caduco.
+          //
+          // Reconectar con esas mismas credenciales volveria a recibir un 401
+          // en bucle, dejando el bot sin QR y sin forma de recuperacion. La
+          // unica salida es borrar la sesion y pedir un QR nuevo, que es
+          // justo lo que hace el reinicio que sigue.
+          console.log('WhatsApp invalido la sesion. Se pedira un QR nuevo.')
+          borrarSesion()
+          intentosReconexion = 0
+          setBotStatus('INITIALIZING', { qr: null })
+          conectar()
+          return
+        }
+
+        intentosReconexion += 1
+
+        if (intentosReconexion > MAX_INTENTOS_RECONEXION) {
+          console.error(
+            `Se alcanzo el limite de ${MAX_INTENTOS_RECONEXION} intentos de reconexion.`,
+          )
+          console.error(
+            'La sesion guardada quedo invalida. Genera un QR nuevo desde el panel para volver a vincular.',
+          )
+          setBotStatus('DISCONNECTED', { qr: null })
+          return
+        }
+
+        connectToWhatsApp()
+      } else if (connection === 'open') {
+        intentosReconexion = 0
+        // La sesión volvió a estar viva: el cierre anterior era histórico.
+        cierreIntencionado = false
+        console.log('AUTENTICACION EXITOSA: Sesion iniciada.')
+        console.log('CLIENTE LISTO: Bot escuchando mensajes.')
+        // Asignar la conexión global para enviar mensajes inmediatos
+        globalSock = sock
+        setBotStatus('CONNECTED', { qr: null })
+        // Procesar mensajes pendientes cuando el bot se conecta
+        processPendingMessages(sock)
+      }
+    })
 
   sock.ev.on('messages.upsert', async (m) => {
     if (m.type !== 'notify') return
@@ -363,6 +516,35 @@ async function connectToWhatsApp() {
       })
     }
   })
+  } finally {
+    // Se libera siempre, incluso si falla la apertura: si el flag quedara en
+    // true, el bot quedaría sin poder reconectarse nunca más.
+    conectandoEnCurso = false
+  }
+}
+
+/** Alias corto para no shadowear el nombre histórico de la función. */
+function conectar() {
+  void connectToWhatsApp()
+}
+
+/** Cancela una reconexión pendiente. */
+function cancelarReconexion(): void {
+  // La reconexión se dispara de inmediato al detectar el cierre, así que
+  // basta con el flag: si ya hay una en vuelo, el guard la ignora.
+  intentosReconexion = 0
+}
+
+/**
+ * Sincroniza la bandera de cierre intencionado con la sesión real.
+ *
+ * Si el vendedor vuelve a conectar desde el panel tras cerrar sesión, el
+ * proceso sigue en marcha y esa bandera debe volver a false; si no, el
+ * siguiente `close` se interpretaría como parte del cierre manual y el bot
+ * se quedaría sin reconectar nunca más.
+ */
+function marcarAperturaDeSesion(): void {
+  cierreIntencionado = false
 }
 
 // Variable global para almacenar la conexión del bot
@@ -497,6 +679,65 @@ async function processPendingMessages(sock: any) {
     }
   }
 }
+
+/**
+ * Detecta la sesión desincronizada y pide un QR nuevo.
+ *
+ * libsignal lanza `MessageCounterError` cuando la sesión guardada ya no puede
+ * descifrar lo que WhatsApp reenvía. Suele pasar con mensajes viejos en cola al
+ * arrancar, o si el número se revitalizó desde otro equipo.
+ *
+ * Estos errores no son recuperables reintentando: la misma sesión fallaría
+ * igual una y otra vez. La única salida es borrar las credenciales y volver a
+ * vincular.
+ *
+ * PERO solo se actúa si el bot NO está funcionando. Si la sesión está
+ * conectada, un mensaje viejo que no se puede descifrar es inofensivo: se
+ * descarta y el bot sigue operando. Borrar ahí una sesión sana obligaría al
+ * vendedor a escanear un QR sin motivo, que es justo lo que hay que evitar.
+ */
+let reintentandoSesion = false
+let erroresDescifrado = 0
+
+process.on('unhandledRejection', (motivo: any) => {
+  const mensaje = String(motivo?.message || motivo || '')
+
+  const esSesionDesincronizada =
+    /MessageCounterError|Key used already|SessionCipher|decrypt/i.test(mensaje)
+
+  if (!esSesionDesincronizada) {
+    // Este handler sustituye al de Node, así que los demás rechazos
+    // seguimos teniendo que reportarlos: si no, se perderían en silencio.
+    console.error('Rechazo no controlado:', motivo)
+    return
+  }
+
+  erroresDescifrado += 1
+
+  if (getBotState().status === 'CONNECTED') {
+    // La sesión vive. El mensaje corrupto se descarta y seguimos.
+    console.warn(
+      `No se pudo descifrar un mensaje antiguo (${erroresDescifrado} en total). ` +
+        'La sesion sigue conectada, no hace falta nada.',
+    )
+    return
+  }
+
+  console.error('La sesion de WhatsApp quedo desincronizada:', mensaje)
+
+  if (reintentandoSesion) {
+    console.error(
+      'Ya se intento recuperar la sesion una vez. Si persiste, reinicia el bot.',
+    )
+    return
+  }
+
+  reintentandoSesion = true
+  console.error('Se borrara la sesion y se pedira un QR nuevo para vincular.')
+
+  borrarSesion()
+  reiniciarConexion()
+})
 
 connectToBackendSocket()
 

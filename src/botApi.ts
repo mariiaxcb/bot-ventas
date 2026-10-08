@@ -38,6 +38,38 @@ export function getBotState(): BotState {
 }
 
 /**
+ * Callback que el bot registra para (re)abrir la conexión de WhatsApp.
+ *
+ * Vive aquí, y no dentro de index.ts, para que este módulo no necesite saber
+ * nada de Baileys: solo avisa "el panel pidió un QR" y quien tiene el socket
+ * decide qué hacer.
+ */
+let pedirConexion: (() => void) | null = null
+
+export function registrarPeticionConexion(fn: () => void): void {
+  pedirConexion = fn
+}
+
+/**
+ * Responde a la petición de QR del panel.
+ *
+ * El botón "Generar QR" no siempre implica una conexión nueva: si WhatsApp ya
+ * emitió un QR y sigue vigente, se devuelve ese mismo. Rotarlo obligaría al
+ * vendedor a escanear de nuevo algo que ya tenía delante.
+ *
+ * @returns El QR vigente, o `null` si aún no hay ninguno.
+ */
+export function requestQr(): string | null {
+  if (state.qr) return state.qr
+
+  if (pedirConexion) {
+    pedirConexion()
+  }
+
+  return state.qr
+}
+
+/**
  * Borra la sesión de WhatsApp del servidor.
  *
  * Sin esto, al reiniciar el bot Baileys volvería a vincular el mismo
@@ -85,12 +117,17 @@ export function iniciarApiBot(
     }
 
     if (req.method === 'POST' && req.url === '/connect') {
-      // El panel lo usa cuando el bot quedó sin QR: relanzamos la conexión
-      // para que Baileys genere uno nuevo.
-      setBotStatus('INITIALIZING', { qr: null })
-      handlers.onConnect()
-      res.writeHead(202, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: true }))
+      // El panel lo usa cuando el bot quedó sin QR. Se responde con el QR
+      // vigente si lo hay, para que el panel pueda mostrarlo de inmediato.
+      const qr = requestQr()
+
+      if (!qr) {
+        setBotStatus('INITIALIZING', { qr: null })
+        handlers.onConnect()
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, qr }))
       return
     }
 
