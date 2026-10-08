@@ -204,6 +204,20 @@ function mencionaTiktok(text: string): boolean {
 }
 
 /**
+ * Quita las apariciones sueltas de "tiktok" del mensaje.
+ *
+ * La palabra abre el flujo pero no es un dato de la reserva. Sin quitarla, un
+ * mensaje que solo dice "Tiktok" se interpreta como nombre de usuario y el bot
+ * termina pidiendo únicamente el código de producto.
+ *
+ * Solo se quitan palabras completas: en un usuario como "tiktok_shop" el
+ * "tiktok" forma parte del nombre y debe quedarse.
+ */
+function quitarPalabraTiktok(text: string): string {
+  return text.replace(/\btiktok\b/gi, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/**
  * ¿Seguimos en conversación con esta persona?
  *
  * Si la última vez que mencionó TikTok fue hace poco, el flujo sigue abierto y
@@ -758,9 +772,7 @@ async function connectToWhatsApp() {
     // reserva a quien solo está saludando.
     if (!enConversacion(realWhatsapp)) {
       if (!mencionaTiktok(incomingText)) {
-        console.log(
-          `Mensaje sin "tiktok" de ${realWhatsapp}: se ignora.`,
-        )
+        console.log(`Mensaje sin "tiktok" de ${realWhatsapp}: se ignora.`)
         return
       }
 
@@ -770,7 +782,13 @@ async function connectToWhatsApp() {
       ultimoTikTok.set(realWhatsapp, Date.now())
     }
 
-    const parsedData = parseReservationMessage(incomingText)
+    // "tiktok" es la palabra que abre el flujo, no un dato de la reserva. Si se
+    // dejara en el texto, el parser leería "Tiktok" como nombre de usuario y
+    // el bot respondería pidiendo solo el código de producto, cuando en
+    // realidad el comprador aún no mandó ningún dato.
+    const sinPalabraApertura = quitarPalabraTiktok(incomingText)
+
+    const parsedData = parseReservationMessage(sinPalabraApertura)
 
     // Mensaje que no trae datos de reserva: se explica el formato en tres
     // mensajes. Se separa porque en un solo bloque el celular lo muestra como
@@ -808,6 +826,16 @@ async function connectToWhatsApp() {
         text: username
           ? 'Gracias. Ahora envia el codigo de producto en este formato:\n\ncodigo de producto:'
           : 'Gracias. Ahora envia tu nombre de usuario en este formato:\n\nnombre de usuario:',
+      })
+
+      // El ejemplo va también aquí. Pedir solo el campo que falta, sin mostrar
+      // cómo se ve un mensaje completo, deja al comprador adivinando el
+      // formato y es justo lo que hizo que el flujo se trabara.
+      await sock.sendMessage(userJid, {
+        text:
+          username
+            ? 'Por ejemplo:\n\ncodigo de producto: mouseX6'
+            : 'Por ejemplo:\n\nnombre de usuario: pepito123',
       })
 
       return
