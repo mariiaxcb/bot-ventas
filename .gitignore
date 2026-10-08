@@ -4,3 +4,7 @@ dist
 .wwebjs_cache
 auth_info_baileys
 .env
+
+# Caché de TypeScript. La regenera `tsc` y cambia en cada compilación.
+tsconfig.tsbuildinfo
+*.bak
