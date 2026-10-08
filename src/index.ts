@@ -17,6 +17,8 @@ import {
   generateQr,
   updateOrderStatus,
   getPendingOrderByWhatsapp,
+  findPendingReservation,
+  cancelReservation,
   uploadReceipt,
 } from './api.service.js'
 import {
@@ -93,9 +95,119 @@ const secondNotificationMs =
 const reservationLostMs = Number(process.env.RESERVATION_LOST_MS) || 300000
 const orderCancelMs = Number(process.env.ORDER_CANCEL_MS) || 360000
 
+/**
+ * Datos de una reserva a medio camino.
+ *
+ * El comprador puede mandar "nombre de usuario" y "codigo de producto" en
+ * mensajes separados, que es lo habitual en un chat. Guardar lo que ya llegó
+ * evita pedirle que lo escriba dos veces.
+ */
+const estadoEnCurso = new Map<
+  string,
+  { username: string; productCode: string }
+>()
+
+/**
+ * Gestiona "Cancelar Reserva".
+ *
+ * El cliente no conoce el id de su reserva, solo el usuario con el que reservó,
+ * así que primero se busca esa reserva pendiente y luego se cancela. Si no hay
+ * ninguna, se le avisa con claridad: puede que ya haya pagado, y en ese caso
+ * el problema es otro.
+ */
+async function cancelarReserva(sock: any, userJid: string): Promise<void> {
+  const numero = userJid.split('@')[0]
+  const pendiente = estadoEnCurso.get(numero)?.username
+
+  try {
+    // Prioridad: lo que el cliente ya escribió en esta conversación. Si no,
+    // se busca por el número de WhatsApp, que es el dato con el que se creó
+    // la orden.
+    const reserva = pendiente ? await findPendingReservation(pendiente) : null
+
+    if (reserva) {
+      await cancelReservation(reserva.id)
+      estadoEnCurso.delete(numero)
+
+      await sock.sendMessage(userJid, {
+        text:
+          `Estimado cliente su reserva fue cancelada. ` +
+          `Para adquirir algun producto, por favor ingrese al live.`,
+      })
+
+      console.log(`Reserva #${reserva.id} cancelada por el cliente ${numero}.`)
+      return
+    }
+
+    // No hay reserva local, pero puede haber una orden pendiente creada desde
+    // el chat. Se cancela para que el cliente no siga recibiendo avisos de
+    // pago por algo que ya no quiere.
+    const orden = await getPendingOrderByWhatsapp(numero)
+
+    if (!orden) {
+      await sock.sendMessage(userJid, {
+        text:
+          `Estimado cliente, no encontramos una reserva pendiente a su nombre. ` +
+          `Si ya realizo el pago, por favor escribale al vendedor. ` +
+          `Para adquirir algun producto, por favor ingrese al live.`,
+      })
+      return
+    }
+
+    await updateOrderStatus(orden.id, 'CANCELLED')
+    estadoEnCurso.delete(numero)
+
+    await sock.sendMessage(userJid, {
+      text:
+        `Estimado cliente su reserva fue cancelada. ` +
+        `Para adquirir algun producto, por favor ingrese al live.`,
+    })
+
+    console.log(`Orden #${orden.id} cancelada por el cliente ${numero}.`)
+  } catch (error: any) {
+    console.error('Error cancelando la reserva:', error?.message || error)
+
+    await sock.sendMessage(userJid, {
+      text:
+        `Ocurrio un problema al cancelar su reserva. ` +
+        `Por favor intente de nuevo en unos minutos.`,
+    })
+  }
+}
+
+/**
+ * Detecta si el cliente quiere cancelar su reserva.
+ *
+ * Acepta varias formas porque el comprador escribe como le sale: "Cancelar
+ * Reserva", "cancelar reserva", "cancelar" o "ya no quiero el producto".
+ */
+function esSolicitudDeCancelacion(text: string): boolean {
+  const limpio = text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/[^\p{L}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (limpio.includes('cancelar reserva')) return true
+  if (limpio === 'cancelar' || limpio === 'cancelar por favor') return true
+  if (limpio.includes('ya no quiero')) return true
+
+  return false
+}
+
+/**
+ * Parsea los datos de la reserva.
+ *
+ * Acepta los dos campos juntos o por separado: en WhatsApp es habitual que el
+ * comprador escriba "nombre de usuario: pepito123", espere el QR y luego
+ * mande "codigo de producto: mouseX6" al ver que el bot pide los dos. Rechazar
+ * el segundo mensaje dejaria al cliente sin poder comprar.
+ */
 function parseReservationMessage(
   text: string,
-): { username: string; productCode: string } | null {
+): { username: string | null; productCode: string | null } | null {
   const clean = text.trim()
   const userRegex = /(?:nombre\s*de\s*usuario|usuario|user)\s*:\s*([^\n\r]+)/i
   const productRegex =
@@ -104,14 +216,25 @@ function parseReservationMessage(
   const userMatch = clean.match(userRegex)
   const productMatch = clean.match(productRegex)
 
-  if (userMatch && productMatch) {
-    return {
-      username: userMatch[1].trim().toLowerCase().replace(/^@/, ''),
-      productCode: productMatch[1].trim().toUpperCase(),
-    }
-  }
+  // Si no hay ninguna de las dos etiquetas, no es un mensaje de reserva.
+  if (!userMatch && !productMatch) return null
 
-  return null
+  return {
+    username: userMatch
+      ? userMatch[1].trim().toLowerCase().replace(/^@/, '')
+      : null,
+    productCode: productMatch ? productMatch[1].trim().toUpperCase() : null,
+  }
+}
+
+/**
+ * Convierte el texto en algo presentable como nombre de usuario.
+ *
+ * Se quita el @ y se pasan a minúsculas porque así es como el backend guarda
+ * la reserva; sin esto, "pepito123" y "@Pepito123" no casarían.
+ */
+function limpiarUsername(valor: string): string {
+  return valor.trim().replace(/^@/, '').toLowerCase()
 }
 
 /**
@@ -364,7 +487,7 @@ async function connectToWhatsApp() {
       }
 
       await sock.sendMessage(userJid, {
-        text: '⏳ Recibimos tu comprobante. Estamos analizándolo con Inteligencia Artificial, por favor espera unos segundos...',
+        text: 'Recibimos tu comprobante. Estamos analizandolo, por favor espere unos segundos.',
       })
 
       try {
@@ -378,7 +501,7 @@ async function connectToWhatsApp() {
         await uploadReceipt(pendingOrder.id, buffer as Buffer)
 
         await sock.sendMessage(userJid, {
-          text: '✅ Comprobante recibido y analizado correctamente.\n\nTu pago está siendo validado por el vendedor. Te notificaremos cuando se confirme. 🙏',
+          text: 'Comprobante recibido y analizado correctamente.\n\nTu pago esta siendo validado por el vendedor. Te notificaremos cuando se confirme.',
         })
       } catch (error: any) {
         await sock.sendMessage(userJid, {
@@ -393,33 +516,91 @@ async function connectToWhatsApp() {
 
     if (!incomingText) return
 
+    // "Cancelar Reserva" tiene prioridad sobre todo lo demás: si el cliente
+    // está arrepentido, no querés que el bot intente interpretarlo como datos
+    // de una reserva nueva.
+    if (esSolicitudDeCancelacion(incomingText)) {
+      await cancelarReserva(sock, userJid)
+      return
+    }
+
     const parsedData = parseReservationMessage(incomingText)
 
+    // Mensaje que no trae datos de reserva: se explica el formato en dos
+    // mensajes. Se separa porque en un solo bloque el celular lo muestra como
+    // un párrafo largo y el cliente no distingue qué tiene que responder.
     if (!parsedData) {
       await sock.sendMessage(userJid, {
-        text: 'Gracias por comunicarte con Tienda LiveSales, Si realizaste una reserva por tiktok, por favor envianos la siguiente informacion en este formato:\n\nnombre de usuario:\ncodigo de producto:',
+        text: 'Gracias por comunicarte con Tienda LiveSales, Si realizaste una reserva por tiktok, por favor envianos la siguiente informacion en este formato:',
       })
+
+      await sock.sendMessage(userJid, {
+        text: 'nombre de usuario:\ncodigo de producto:',
+      })
+
+      return
+    }
+
+    // Llegó solo uno de los dos campos. Guardamos el que vino y pedimos el
+    // otro, para que el comprador pueda mandarlos en mensajes separados.
+    const { username, productCode } = parsedData
+
+    if (!username || !productCode) {
+      estadoEnCurso.set(realWhatsapp, {
+        username: username ?? estadoEnCurso.get(realWhatsapp)?.username ?? '',
+        productCode:
+          productCode ?? estadoEnCurso.get(realWhatsapp)?.productCode ?? '',
+      })
+
+      await sock.sendMessage(userJid, {
+        text: username
+          ? 'Gracias. Ahora envia el codigo de producto en este formato:\n\ncodigo de producto:'
+          : 'Gracias. Ahora envia tu nombre de usuario en este formato:\n\nnombre de usuario:',
+      })
+
       return
     }
 
     try {
       const reservations = await getActiveReservations()
 
+      const usernameLimpio = limpiarUsername(username)
+
       const found = reservations.find((r: any) => {
         const matchUser =
           r.tiktokUsername.trim().toLowerCase().replace(/^@/, '') ===
-          parsedData.username
+          usernameLimpio
         const matchCode =
-          r.productCode.trim().toUpperCase() === parsedData.productCode
+          r.productCode.trim().toUpperCase() === productCode
         return matchUser && matchCode
       })
 
+      // Puede que el usuario no coincida porque escribio mal el producto, o
+      // al revés. Un mensaje por caso ayuda más que un "no se encontró".
+      const usuarioExiste = reservations.some(
+        (r: any) =>
+          r.tiktokUsername.trim().toLowerCase().replace(/^@/, '') ===
+          usernameLimpio,
+      )
+
       if (!found) {
+        if (!usuarioExiste) {
+          await sock.sendMessage(userJid, {
+            text: 'Debe ir al live de @LiveSales y realizar su reserva.',
+          })
+          return
+        }
+
         await sock.sendMessage(userJid, {
-          text: 'Debe ir al live de @LiveSales y realizar su reserva.',
+          text: `El codigo de producto "${productCode}" no coincide con tu reserva. Revisa el codigo que aparecio en el live e intentalo de nuevo.`,
         })
+
         return
       }
+
+      // La reserva quedó confirmada: ya no tiene sentido cancelarla desde el
+      // chat, así que se limpia el estado a medio camino.
+      estadoEnCurso.delete(realWhatsapp)
 
       const priceNumber = parseFloat(found.product.price)
 
@@ -440,15 +621,26 @@ async function connectToWhatsApp() {
       const currentOrderId = order.id
       const qrData = await generateQr(currentOrderId)
 
-      const paymentInstructions =
-        'Por favor realice el pago de su producto con el siguiente QR o ingresando al enlace de pago directo:\n' +
-        `${qrData.qrUrl}\n\n` +
-        '*NOTA: Tiene 5 minutos desde este momento para realizar su pago, caso contrario perdera la reserva.*\n\n' +
-        'Una vez realizado el pago por favor envie la fotografía del comprobante. En caso de no poder continuar, escriba: Cancelar Reserva.'
+      // Aviso de que la reserva quedó validada, antes de pedir el pago. Así el
+      // cliente sabe que el bot confirmó sus datos y no está esperando otra
+      // cosa.
+      await sock.sendMessage(userJid, {
+        text: 'Su reserva fue validada, por favor proceda con el pago del producto por favor.',
+      })
 
+      // El QR va en su propio mensaje: se envía la imagen sin texto y las
+      // instrucciones aparte, para que el código no quede comprimido ni
+      // corriendo detrás del pie de foto.
       await sock.sendMessage(userJid, {
         image: { url: qrData.qrImageUrl },
-        caption: paymentInstructions,
+      })
+
+      await sock.sendMessage(userJid, {
+        text:
+          'Por favor realice el pago de su producto con el siguiente QR o ingresando al enlace de pago directo:\n' +
+          `${qrData.qrUrl}\n\n` +
+          'NOTA: Tiene 5 minutos desde este momento para realizar su pago, caso contrario perdera la reserva.\n\n' +
+          'Una vez realizado el pago por favor envie la fotografía del comprobante. En caso de no poder continuar, escriba: Cancelar Reserva.',
       })
 
       setTimeout(async () => {
@@ -633,24 +825,71 @@ async function connectToBackendSocket() {
       ).replace(/^@/, '')
 
       const jid = resolverJid(numero)
-      const mensaje =
-        `✅ ¡Buenas noticias ${nombreUsuario}!\n\n` +
+
+      // Confirmación en dos mensajes: el segundo es la dirección de la tienda.
+      // Ir en uno solo lo dejaba buried en un párrafo con la confirmación.
+      const confirmacion =
+        `¡Buenas noticias ${nombreUsuario}!\n\n` +
         `Tu pago ha sido verificado por el vendedor.\n` +
         `Tu pedido #${data.pedidoId} ha sido confirmado exitosamente.\n\n` +
-        `¡Gracias por tu compra! 🎉`
+        `¡Gracias por tu compra!`
+
+      const entrega =
+        `Puedes pasar a recoger tu pedido en nuestra tienda ubicada al frente del correo, ` +
+        `en el edificio Portales oficina #16.`
 
       if (!globalSock) {
         console.warn('Sin sesion de WhatsApp: confirmacion encolada.')
+        pendingMessages.push({ jid, message: confirmacion })
+        pendingMessages.push({ jid, message: entrega })
+        return
+      }
+
+      try {
+        await globalSock.sendMessage(jid, { text: confirmacion })
+        await globalSock.sendMessage(jid, { text: entrega })
+        console.log(`Pago del pedido #${data.pedidoId} confirmado con el cliente.`)
+      } catch (error: any) {
+        console.error(
+          `No se pudo confirmar el pedido #${data.pedidoId}:`,
+          error?.message || error,
+        )
+        pendingMessages.push({ jid, message: confirmacion })
+        pendingMessages.push({ jid, message: entrega })
+      }
+    },
+  )
+
+  /**
+   * El vendedor rechazó el comprobante.
+   *
+   * Se pide al cliente que verifique porque lo más probable es que el monto no
+   * se haya acreditado todavía, o que haya enviado el comprobante equivocado.
+   */
+  socket.on(
+    'pago:rechazado',
+    async (data: { pedidoId: number; whatsapp: string }) => {
+      const numero = String(data.whatsapp || '').replace(/\D/g, '')
+      const jid = resolverJid(numero)
+
+      const mensaje =
+        `Su comprobante del pedido #${data.pedidoId} no pudo ser validado. ` +
+        `Por favor verifique su pago, ya que no se recibio el pago en nuestra cuenta. ` +
+        `Si realizo la transferencia, esperemos unos minutos y envie el comprobante nuevamente.`
+
+      if (!globalSock) {
         pendingMessages.push({ jid, message: mensaje })
         return
       }
 
       try {
         await globalSock.sendMessage(jid, { text: mensaje })
-        console.log(`Pago del pedido #${data.pedidoId} confirmado con el cliente.`)
+        console.log(
+          `Rechazo del pedido #${data.pedidoId} comunicado al cliente.`,
+        )
       } catch (error: any) {
         console.error(
-          `No se pudo confirmar el pedido #${data.pedidoId}:`,
+          `No se pudo comunicar el rechazo del pedido #${data.pedidoId}:`,
           error?.message || error,
         )
         pendingMessages.push({ jid, message: mensaje })

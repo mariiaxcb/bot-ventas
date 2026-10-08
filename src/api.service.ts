@@ -224,6 +224,56 @@ export async function getPendingOrderByWhatsapp(
   return orderData.data[0]
 }
 
+/**
+ * Busca la reserva pendiente de un comprador por su usuario de TikTok.
+ *
+ * El bot la usa para resolver "Cancelar Reserva": el cliente no conoce el id
+ * de la reserva, solo el usuario con el que reservó.
+ */
+export async function findPendingReservation(
+  username: string,
+): Promise<{ id: number; tiktokUsername: string; productCode: string } | null> {
+  if (!cachedToken) {
+    await login()
+  }
+
+  try {
+    const response = await fetchWithAuth(
+      `/reservations/pending?username=${encodeURIComponent(username)}`,
+    )
+
+    const result = await response.json()
+
+    if (!response.ok) {
+      console.error('Error buscando reserva pendiente:', result)
+      return null
+    }
+
+    return result.data ?? null
+  } catch (error: any) {
+    console.error('Error buscando reserva pendiente:', error?.message || error)
+    return null
+  }
+}
+
+/** Cancela una reserva por id. El backend emite `reserva:cancelada`. */
+export async function cancelReservation(reservationId: number): Promise<void> {
+  if (!cachedToken) {
+    await login()
+  }
+
+  const response = await fetchWithAuth(`/reservations/${reservationId}`, {
+    method: 'DELETE',
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(
+      `Error cancelando la reserva ${reservationId}: ${response.status} - ${errorText}`,
+    )
+  }
+}
+
 export async function uploadReceipt(
   orderId: number,
   imageBuffer: Buffer,
