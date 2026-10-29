@@ -2,11 +2,9 @@ import dotenv from 'dotenv'
 
 dotenv.config()
 
-const API_BASE_URL = process.env.API_BASE_URL || 'http://localhost:8080/api'
-const API_USERNAME = process.env.API_USERNAME || 'Admin'
-const API_PASSWORD = process.env.API_PASSWORD || 'Admin'
+import { obtenerToken, invalidarToken } from './auth.service.js'
 
-let cachedToken: string | null = null
+const API_BASE_URL = process.env.API_BASE_URL || 'http://localhost:8080/api'
 
 export interface ReservationItem {
   id: number
@@ -64,40 +62,22 @@ export interface GenerateQrResponseData {
   expiresAt?: string
 }
 
-async function login(): Promise<string> {
-  console.log('Solicitando autenticacion a la API...')
-  const response = await fetch(`${API_BASE_URL}/auth/login`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      username: API_USERNAME,
-      password: API_PASSWORD,
-    }),
-  })
-
-  if (!response.ok) {
-    throw new Error(`Fallo login: ${response.status} ${response.statusText}`)
-  }
-
-  const result = await response.json()
-  console.log('Login exitoso en la API.')
-  cachedToken = result.data.token
-  return cachedToken as string
-}
-
+/**
+ * Ejecuta una peticion autenticada contra la API.
+ *
+ * - Obtiene el token vigente del servicio de autenticacion.
+ * * Si el backend responde 401 (token expirado), invalida el token, hace
+ *   login de nuevo y reintenta la peticion una sola vez.
+ */
 async function fetchWithAuth(
   endpoint: string,
   options: RequestInit = {},
 ): Promise<Response> {
-  if (!cachedToken) {
-    await login()
-  }
+  const token = await obtenerToken()
 
   const headers = {
     ...options.headers,
-    Authorization: `Bearer ${cachedToken}`,
+    Authorization: `Bearer ${token}`,
   }
 
   let response = await fetch(`${API_BASE_URL}${endpoint}`, {
@@ -106,11 +86,14 @@ async function fetchWithAuth(
   })
 
   if (response.status === 401) {
-    console.log('Token expirado o no autorizado. Reintentando login...')
-    await login()
+    console.log(
+      'Token expirado o no autorizado. Reintentando login y peticion...',
+    )
+    invalidarToken()
+    const retryToken = await obtenerToken()
     const retryHeaders = {
       ...options.headers,
-      Authorization: `Bearer ${cachedToken}`,
+      Authorization: `Bearer ${retryToken}`,
     }
     response = await fetch(`${API_BASE_URL}${endpoint}`, {
       ...options,
@@ -151,7 +134,9 @@ export async function createOrder(
   if (!response.ok) {
     console.error('Detalle error API createOrder:', JSON.stringify(result))
     throw new Error(
-      `Error al crear orden: ${response.status} - ${result.mensaje ?? result.message ?? response.statusText}`,
+      `Error al crear orden: ${response.status} - ${
+        result.mensaje ?? result.message ?? response.statusText
+      }`,
     )
   }
 
@@ -228,15 +213,11 @@ export async function getPendingOrderByWhatsapp(
  * Busca la reserva pendiente de un comprador por su usuario de TikTok.
  *
  * El bot la usa para resolver "Cancelar Reserva": el cliente no conoce el id
- * de la reserva, solo el usuario con el que reservó.
+ * de la reserva, solo el usuario con el que reservo.
  */
 export async function findPendingReservation(
   username: string,
 ): Promise<{ id: number; tiktokUsername: string; productCode: string } | null> {
-  if (!cachedToken) {
-    await login()
-  }
-
   try {
     const response = await fetchWithAuth(
       `/reservations/pending?username=${encodeURIComponent(username)}`,
@@ -258,10 +239,6 @@ export async function findPendingReservation(
 
 /** Cancela una reserva por id. El backend emite `reserva:cancelada`. */
 export async function cancelReservation(reservationId: number): Promise<void> {
-  if (!cachedToken) {
-    await login()
-  }
-
   const response = await fetchWithAuth(`/reservations/${reservationId}`, {
     method: 'DELETE',
   })
@@ -278,9 +255,7 @@ export async function uploadReceipt(
   orderId: number,
   imageBuffer: Buffer,
 ): Promise<any> {
-  if (!cachedToken) {
-    await login()
-  }
+  const token = await obtenerToken()
 
   const formData = new FormData()
   const blob = new Blob([new Uint8Array(imageBuffer)], { type: 'image/jpeg' })
@@ -290,7 +265,7 @@ export async function uploadReceipt(
     const response = await fetch(`${API_BASE_URL}/orders/${orderId}/receipt`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${cachedToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: formData as any,
     })
@@ -299,12 +274,14 @@ export async function uploadReceipt(
 
     if (!response.ok) {
       console.error('Error detallado devuelto por el backend:', result)
-      throw new Error((result.mensaje ?? result.message) || 'Error procesando el comprobante')
+      throw new Error(
+        (result.mensaje ?? result.message) || 'Error procesando el comprobante',
+      )
     }
 
     return result.data
   } catch (err: any) {
-    console.error('Fallo crítico en fetch uploadReceipt:', err.message)
+    console.error('Fallo critico en fetch uploadReceipt:', err.message)
     throw err
   }
 }
