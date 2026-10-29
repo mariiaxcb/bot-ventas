@@ -21,6 +21,7 @@ import {
   cancelReservation,
   uploadReceipt,
 } from './api.service.js'
+import { obtenerToken, invalidarToken } from './auth.service.js'
 import {
   setBotStatus,
   getBotState,
@@ -810,6 +811,11 @@ function marcarAperturaDeSesion(): void {
 // Variable global para almacenar la conexión del bot
 let globalSock: any = null
 
+// Conexión WebSocket al backend (notificaciones de pago)
+let socketBackend: any = null
+let intentosBackend = 0
+let backendCerradoIntencionalmente = false
+
 /**
  * Mapa: numeroDeWhatsapp -> JID real del contacto.
  *
@@ -835,40 +841,97 @@ function resolverJid(numero: string): string {
 }
 
 // Conectar al Socket.IO del backend para escuchar pagos validados
-async function connectToBackendSocket() {
-  // El backend exige un JWT valido para aceptar conexiones de socket.
-  let authToken: string | null = null
+//
+// El backend exige un JWT valido para aceptar conexiones de socket. En lugar
+// de hacer un login único al arranque y reintentar con el mismo token
+// (posiblemente invalido o expirado) en bucle infinito, esta versión:
+//   1. Obtiene un token fresco con reintentos y backoff antes de conectar.
+//   2. Desactiva la reconexion automática de socket.io: la manejamos nosotros
+//      con backoff exponencial, invalidando el token tras un error de auth.
+//   3. Nunca bloquea al bot de WhatsApp: si el backend esta caído, el flujo de
+//      reservas sigue funcionando por HTTP.
+async function obtenerTokenConReintentos(maxIntentos = 5): Promise<string> {
+  let ultimoError: any = null
+  for (let i = 0; i < maxIntentos; i++) {
+    try {
+      return await obtenerToken()
+    } catch (error) {
+      ultimoError = error
+      const espera = Math.min(1000 * 2 ** i, 10_000)
+      console.error(
+        `[Backend] Intento de autenticacion ${i + 1}/${maxIntentos} fallo: ${
+          (error as Error)?.message ?? error
+        }. Reintentando en ${espera / 1000}s...`,
+      )
+      await new Promise((r) => setTimeout(r, espera))
+    }
+  }
+  throw ultimoError
+}
+
+function programarReconexionBackend(): void {
+  if (backendCerradoIntencionalmente) return
+
+  const espera = Math.min(1000 * 2 ** intentosBackend, 30_000)
+  intentosBackend += 1
+  console.log(`[Backend] Reconectando en ${espera / 1000}s...`)
+  setTimeout(() => {
+    if (backendCerradoIntencionalmente) return
+    void conectarBackend()
+  }, espera)
+}
+
+async function conectarBackend(): Promise<void> {
+  // Cerrar socket anterior si existe, para no dejar listeners huérfanos.
+  if (socketBackend) {
+    try {
+      socketBackend.disconnect()
+    } catch {}
+    socketBackend = null
+  }
+
+  let token: string | null = null
   try {
-    const loginResponse = await fetch(`${BACKEND_URL}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        username: process.env.API_USERNAME || 'Admin',
-        password: process.env.API_PASSWORD || 'Admin',
-      }),
-    })
-    const loginData = await loginResponse.json()
-    authToken = loginData.data?.token ?? null
+    token = await obtenerTokenConReintentos(5)
   } catch (error) {
-    console.error('No se pudo autenticar contra el backend:', error)
+    console.error(
+      '[Backend] No se pudo autenticar tras varios intentos. Se sigue reintentando:',
+      (error as Error)?.message ?? error,
+    )
+    programarReconexionBackend()
+    return
   }
 
   const socket = socketIO(BACKEND_URL, {
     transports: ['websocket', 'polling'],
-    reconnection: true,
-    auth: { token: authToken },
+    reconnection: false,
+    auth: { token },
   })
+
+  socketBackend = socket
 
   socket.on('connect', () => {
     console.log('Bot conectado al backend.')
+    intentosBackend = 0
   })
 
   socket.on('disconnect', (reason) => {
     console.log('Bot desconectado del backend:', reason)
+    // Si fue por error de autenticacion, invalido el token para forzar re-login.
+    if (/auth|token|unauthorized/i.test(String(reason))) {
+      invalidarToken()
+    }
+    if (!backendCerradoIntencionalmente) {
+      programarReconexionBackend()
+    }
   })
 
   socket.on('connect_error', (error) => {
     console.error('Error de conexion con el backend:', error.message)
+    invalidarToken()
+    if (!backendCerradoIntencionalmente) {
+      programarReconexionBackend()
+    }
   })
 
   /**
@@ -964,8 +1027,21 @@ async function connectToBackendSocket() {
       }
     },
   )
+}
 
-  return socket
+/**
+ * Cierra la conexión WebSocket con el backend de forma intencionada.
+ * Se usa al apagar el bot para evitar reconexiones huérfanas.
+ */
+export function cerrarBackend(): void {
+  backendCerradoIntencionalmente = true
+  intentosBackend = 0
+  if (socketBackend) {
+    try {
+      socketBackend.disconnect()
+    } catch {}
+    socketBackend = null
+  }
 }
 
 // Cola de mensajes pendientes para enviar cuando el bot este conectado
@@ -1046,6 +1122,6 @@ process.on('unhandledRejection', (motivo: any) => {
   reiniciarConexion()
 })
 
-connectToBackendSocket()
+conectarBackend()
 
 connectToWhatsApp()
