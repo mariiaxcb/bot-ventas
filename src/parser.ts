@@ -176,8 +176,24 @@ function parsearDatosSueltos(clean: string): DatosReserva | null {
     .map((p) => p.trim())
     .filter(Boolean)
 
-  if (palabras.length < 2 || palabras.length > MAX_PALABRAS) return null
+  if (palabras.length === 0 || palabras.length > MAX_PALABRAS) return null
 
+  // Un solo token nunca es suficiente: no sabemos si es usuario o código.
+  if (palabras.length === 1) return null
+
+  // Dos tokens: el primero es el username, el segundo el código.
+  // El código debe tener al menos un número para diferenciarlo de una palabra común.
+  if (palabras.length === 2) {
+    const codigo = palabras[1].toUpperCase()
+    if (!RE_TOKEN_DATO.test(codigo)) return null
+    if (!/\d/.test(codigo)) return null
+    return {
+      username: limpiarUsername(palabras[0]),
+      productCode: codigo,
+    }
+  }
+
+  // Tres o más tokens: buscar el primer token que parezca usuario y tomar el siguiente como código.
   const indiceUsuario = palabras.findIndex((p) => pareceNombreDeUsuario(p))
 
   if (indiceUsuario === -1) return null
