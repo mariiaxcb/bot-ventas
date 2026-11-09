@@ -101,11 +101,35 @@ iniciarApiBot(BOT_API_PORT, {
   },
 })
 
-const firstNotificationMs = Number(process.env.FIRST_NOTIFICATION_MS) || 120000
+const MINUTO_MS = 60_000
+
+/**
+ * La reserva vive 3 minutos, igual que el TTL del backend
+ * (RESERVATION_TTL_MINUTES=3). Los recordatorios se derivan de ese TTL para
+ * que los mensajes y los temporizadores no puedan desalinearse.
+ */
+const RESERVA_TTL_MS = 3 * MINUTO_MS
+
+const reservationLostMs =
+  Number(process.env.RESERVATION_LOST_MS) || RESERVA_TTL_MS
+const firstNotificationMs =
+  Number(process.env.FIRST_NOTIFICATION_MS) || reservationLostMs / 3
 const secondNotificationMs =
-  Number(process.env.SECOND_NOTIFICATION_MS) || 240000
-const reservationLostMs = Number(process.env.RESERVATION_LOST_MS) || 300000
-const orderCancelMs = Number(process.env.ORDER_CANCEL_MS) || 360000
+  Number(process.env.SECOND_NOTIFICATION_MS) || (reservationLostMs * 2) / 3
+const orderCancelMs = Number(process.env.ORDER_CANCEL_MS) || reservationLostMs
+
+/** "1 minuto" o "N minutos", redondeando hacia arriba para no prometer de menos. */
+function textoMinutos(ms: number): string {
+  const minutos = Math.max(1, Math.ceil(ms / MINUTO_MS))
+  return minutos === 1 ? '1 minuto' : `${minutos} minutos`
+}
+
+/** Aviso de tiempo restante; el verbo concuerda con los minutos que quedan. */
+function avisoTiempoRestante(transcurridoMs: number): string {
+  const restantes = Math.max(0, reservationLostMs - transcurridoMs)
+  const verbo = restantes <= MINUTO_MS ? 'queda' : 'quedan'
+  return `Atencion le ${verbo} ${textoMinutos(restantes)} para realizar el pago o perdera la reserva`
+}
 
 /**
  * Datos de una reserva a medio camino.
@@ -700,7 +724,7 @@ async function connectToWhatsApp() {
         text:
           'Por favor realice el pago de su producto con el siguiente QR o ingresando al enlace de pago directo:\n' +
           `${qrData.qrUrl}\n\n` +
-          'NOTA: Tiene 5 minutos desde este momento para realizar su pago, caso contrario perdera la reserva.\n\n' +
+          `NOTA: Tiene ${textoMinutos(reservationLostMs)} desde este momento para realizar su pago, caso contrario perdera la reserva.\n\n` +
           'Una vez realizado el pago por favor envie la fotografía del comprobante. En caso de no poder continuar, escriba: Cancelar Reserva.',
       })
 
@@ -713,7 +737,7 @@ async function connectToWhatsApp() {
             current.status === 'PENDING'
           ) {
             await sock.sendMessage(userJid, {
-              text: 'Atencion le quedan 3 minutos para realizar el pago o perdera la reserva',
+              text: avisoTiempoRestante(firstNotificationMs),
             })
           }
         } catch (err) {}
@@ -728,7 +752,7 @@ async function connectToWhatsApp() {
             current.status === 'PENDING'
           ) {
             await sock.sendMessage(userJid, {
-              text: 'Atencion le queda 1 minuto para realizar el pago o perdera la reserva',
+              text: avisoTiempoRestante(secondNotificationMs),
             })
           }
         } catch (err) {}
